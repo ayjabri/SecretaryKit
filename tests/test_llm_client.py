@@ -5,7 +5,7 @@ Tests for llm_client.py.
     python tests/test_llm_client.py --server   # + your real Ollama server
 
 The real server and model can be changed with LLM_HOST and LLM_MODEL,
-e.g. LLM_HOST=http://10.0.0.100:11434 LLM_MODEL=qwen3:8b.
+e.g. LLM_HOST=http://10.0.0.100:11434 LLM_MODEL=qwen3.5:4b.
 RUN_SERVER_TESTS=1 is equivalent to --server.
 """
 
@@ -64,7 +64,7 @@ def openai_lines(*tokens):
 class FakeServer:
     """httpx transport that records requests and replays canned replies."""
 
-    def __init__(self, replies=(), models=("qwen3:8b",)):
+    def __init__(self, replies=(), models=("qwen3.5:4b",)):
         self.replies = list(replies)
         self.models = list(models)
         self.requests = []
@@ -112,13 +112,13 @@ class OllamaTests(unittest.TestCase):
 
     def test_request_body(self):
         server = FakeServer([ollama_lines("ok")])
-        client = make_client(server, model="qwen3:14b", temperature=0.2,
+        client = make_client(server, model="qwen3.6:27b", temperature=0.2,
                              options={"num_ctx": 8192}, system_prompt="Be brief.")
 
         client.chat("Hi")
 
         [body] = server.chat_bodies()
-        self.assertEqual(body["model"], "qwen3:14b")
+        self.assertEqual(body["model"], "qwen3.6:27b")
         self.assertTrue(body["stream"])
         self.assertFalse(body["think"])
         self.assertEqual(body["options"], {"temperature": 0.2, "num_ctx": 8192})
@@ -201,9 +201,9 @@ class OllamaTests(unittest.TestCase):
             client.check_connection()
 
     def test_check_connection_reports_missing_model(self):
-        client = make_client(FakeServer(models=["llama3:8b"]), model="qwen3:8b")
+        client = make_client(FakeServer(models=["llama3:8b"]), model="qwen3.5:4b")
 
-        with self.assertRaisesRegex(LLMError, "qwen3:8b.*llama3:8b"):
+        with self.assertRaisesRegex(LLMError, "qwen3\.5:4b.*llama3:8b"):
             client.check_connection()
 
     def test_history_trimmed(self):
@@ -224,6 +224,103 @@ class OllamaTests(unittest.TestCase):
 
         self.assertEqual(client.chat("Q"), "Answer.")
         self.assertEqual(client.history[-1]["content"], "Answer.")
+
+
+class ThinkingTests(unittest.TestCase):
+
+    def ollama_thinking_reply(self):
+        lines = [
+            {"message": {"role": "assistant", "content": "", "thinking": "Let me "}},
+            {"message": {"role": "assistant", "content": "", "thinking": "compute."}},
+            {"message": {"role": "assistant", "content": "391."}},
+            {"message": {"content": ""}, "done": True},
+        ]
+        return "\n".join(json.dumps(line) for line in lines) + "\n"
+
+    def test_thinking_sent_to_callback_not_reply(self):
+        server = FakeServer([self.ollama_thinking_reply()])
+        client = make_client(server, think=True)
+        thoughts = []
+
+        reply = "".join(client.stream_reply("17*23?", on_thinking=thoughts.append))
+
+        self.assertEqual(reply, "391.")
+        self.assertEqual("".join(thoughts), "Let me compute.")
+        self.assertTrue(server.chat_bodies()[0]["think"])
+        self.assertEqual(client.history[-1]["content"], "391.")
+
+    def test_thinking_ignored_without_callback(self):
+        client = make_client(FakeServer([self.ollama_thinking_reply()]))
+
+        self.assertEqual(client.chat("17*23?"), "391.")
+
+    def test_failing_callback_does_not_break_reply(self):
+        client = make_client(FakeServer([self.ollama_thinking_reply()]))
+
+        def broken(text):
+            raise ValueError("display failed")
+
+        with self.assertLogs("voicekit.llm_client", "ERROR"):
+            reply = "".join(client.stream_reply("Q", on_thinking=broken))
+
+        self.assertEqual(reply, "391.")
+
+    def test_openai_reasoning_content(self):
+        events = [
+            {"choices": [{"delta": {"reasoning_content": "hmm"}}]},
+            {"choices": [{"delta": {"content": "Yes."}}]},
+        ]
+        body = "\n\n".join("data: " + json.dumps(e) for e in events) + "\n\ndata: [DONE]\n\n"
+        client = make_client(FakeServer([body]), api="openai")
+        thoughts = []
+
+        reply = "".join(client.stream_reply("Q", on_thinking=thoughts.append))
+
+        self.assertEqual((reply, thoughts), ("Yes.", ["hmm"]))
+
+
+class ModelInfoTests(unittest.TestCase):
+
+    MODELS = ["qwen3.6:27b", "qwen3.5:4b", "qwen3:14b",
+              "qwen2.5-coder:latest", "qwen2.5-coder:7b", "llama3.1:8b"]
+
+    def resolve(self, spoken):
+        return LLMClient().resolve_model(spoken, self.MODELS)
+
+    def test_resolve_spoken_model_names(self):
+        cases = {
+            "Qwen 3.6 27B": "qwen3.6:27b",
+            "qwen 3 6 27b": "qwen3.6:27b",       # after command normalisation
+            "Quinn three point five": "qwen3.5:4b",
+            "Qwen 3 fourteen b": "qwen3:14b",
+            "Qwen 2.5 coder": "qwen2.5-coder:latest",
+            "Llama 3.1": "llama3.1:8b",
+            "llama": "llama3.1:8b",
+        }
+        for spoken, expected in cases.items():
+            with self.subTest(spoken=spoken):
+                self.assertEqual(self.resolve(spoken), expected)
+
+    def test_unknown_names_do_not_match(self):
+        for spoken in ("mistral", "Python to sort a list", "the big one", ""):
+            with self.subTest(spoken=spoken):
+                self.assertIsNone(self.resolve(spoken))
+
+    def test_capabilities(self):
+        def server(request):
+            name = json.loads(request.content)["model"]
+            caps = ["completion", "thinking"] if "qwen3" in name else ["completion"]
+            return httpx.Response(200, json={"capabilities": caps})
+
+        client = LLMClient(transport=httpx.MockTransport(server))
+
+        self.assertTrue(client.supports_thinking("qwen3.5:4b"))
+        self.assertFalse(client.supports_thinking("llama3.1:8b"))
+
+    def test_capabilities_unknown_for_openai_servers(self):
+        client = LLMClient(LLMConfig(api="openai"))
+
+        self.assertIsNone(client.supports_thinking())
 
 
 # --------------------------------------------------
@@ -314,6 +411,13 @@ class RealServerTests(unittest.TestCase):
             base_url=os.environ.get("LLM_HOST", config.base_url),
             model=os.environ.get("LLM_MODEL", config.model),
         ))
+
+        # Fall back to the smallest installed model if the default is
+        # not on this server (and no LLM_MODEL was given).
+        models = cls.client.list_models()
+        if "LLM_MODEL" not in os.environ and cls.client.config.model not in models:
+            cls.client.config.model = min(models, key=len)
+
         cls.client.check_connection()
         cls.client.warm_up()
 

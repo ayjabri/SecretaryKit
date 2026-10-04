@@ -32,21 +32,37 @@ https://pytorch.org/get-started/locally/. Leave out the `[cuda]` extra for CPU-o
 ## Voice assistant
 
 ```bash
-python voice_assistant.py                                   # Ollama at 10.0.0.100, qwen3:8b
-python voice_assistant.py --model qwen3:14b --voice am_michael
+python voice_assistant.py                                   # Ollama at 10.0.0.100, qwen3.5:4b
+python voice_assistant.py --model qwen3.6:27b --voice am_michael
 python voice_assistant.py --interruptible --output 7         # headphones: talk over it to interrupt
 python voice_assistant.py --api openai --host http://server:8000
 python voice_assistant.py --list-devices
 ```
 
-Say "goodbye" to quit, or "new conversation" to clear the history.
+### Voice commands
+
+These work like `/set think` in `ollama run`, but spoken. The whole utterance must be the command,
+so a question like "how do I stop thinking about work?" still goes to the model.
+
+| Say | Effect |
+|---|---|
+| "set think", "thinking on" | Reasoning models think before replying. The reasoning is shown dimmed in the console. |
+| "set no think", "thinking off" | Answer straight away (the default) |
+| "switch model to Qwen 3.5" | Change model and keep the conversation; loosely heard names are matched |
+| "list models" / "status" | Show the available models / the current model, thinking mode and speed |
+| "speak faster" / "speak slower" / "normal speed" | Change the speaking rate |
+| "new conversation" | Clear the history |
+| "help" | List the commands |
+| "goodbye" / "dismissed" | Quit |
+
+Use `--command-prefix computer` to require a wake word ("Computer, set think").
 
 ## Library usage
 
 ```python
 from voicekit import ContinuousSpeechRecognizer, KokoroSpeaker, LLMClient, LLMConfig
 
-llm = LLMClient(LLMConfig(base_url="http://10.0.0.100:11434", model="qwen3:8b"))
+llm = LLMClient(LLMConfig(base_url="http://10.0.0.100:11434", model="qwen3.5:4b"))
 
 with ContinuousSpeechRecognizer() as ears, KokoroSpeaker() as mouth:
     prompt = ears.listen_once()

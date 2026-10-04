@@ -8,12 +8,21 @@ Hands-free voice conversation with a self-hosted LLM.
 Usage
 -----
     python voice_assistant.py
-    python voice_assistant.py --model qwen3:14b --voice am_michael
+    python voice_assistant.py --model qwen3.6:27b --voice am_michael
     python voice_assistant.py --interruptible        # with headphones
     python voice_assistant.py --api openai --host http://10.0.0.100:8000
     python voice_assistant.py --list-devices
 
-Voice commands: "goodbye" quits, "new conversation" clears the history.
+Voice commands (the whole utterance must be the command):
+    "set think" / "thinking on"         reasoning models think before replying
+    "set no think" / "thinking off"     answer straight away (default)
+    "switch model to Qwen 3.5"          change model; history is kept
+    "list models"                       models available on the server
+    "status"                            current model, thinking and speed
+    "speak faster" / "speak slower"     change the speaking rate
+    "new conversation"                  clear the history
+    "help"                              list the commands
+    "goodbye"                           quit
 """
 
 import argparse
@@ -35,6 +44,7 @@ from voicekit import (
     SpeechRecognizerConfig,
     TextToSpeechConfig,
 )
+from voicekit.commands import NOT_HANDLED, CommandRouter
 
 
 logger = logging.getLogger(__name__)
@@ -62,6 +72,25 @@ class AssistantConfig:
     exit_phrases, reset_phrases
         Spoken commands; a prompt must match one exactly (ignoring case
         and punctuation).
+
+    command_prefix
+        Optional wake word for commands, e.g. "computer": then only
+        "Computer, set think" is a command, never a plain "set think".
+
+    thinking_cue
+        Spoken when a question is sent in thinking mode, since the model
+        may then be silent for a while. None to disable.
+
+    show_thinking
+        Print the model's reasoning (dimmed) while it thinks.
+
+    speed_step
+        How much "speak faster" / "speak slower" changes the rate.
+
+    model_names_as_vocabulary
+        Teach Whisper the server's model names ("Qwen", "Llama"...) so
+        "switch model to ..." is transcribed correctly. Only applies when
+        the recognizer has no hotwords configured.
     """
 
     interruptible: bool = False
@@ -69,7 +98,7 @@ class AssistantConfig:
     greeting: Optional[str] = "Hi, I'm listening."
     goodbye: str = "Goodbye!"
     exit_phrases: tuple = (
-        "goodbye", "good bye", "bye bye", "exit", "quit", "stop listening",
+        "dismissed", "goodbye", "good bye", "bye bye", "exit", "quit", "stop listening",
     )
     reset_phrases: tuple = (
         "new conversation", "reset conversation", "start over",
@@ -77,10 +106,80 @@ class AssistantConfig:
     )
     reset_reply: str = "Okay, starting a new conversation."
     error_reply: str = "Sorry, I couldn't reach the language model."
+    command_prefix: Optional[str] = None
+    thinking_cue: Optional[str] = "Let me think about that."
+    show_thinking: bool = True
+    speed_step: float = 0.1
+    model_names_as_vocabulary: bool = True
 
 
-def _normalize_command(text):
-    return re.sub(r"[^\w\s]", "", text).strip().lower()
+# Spoken command patterns. They are matched against the whole utterance
+# after normalisation (lower case, punctuation replaced by spaces), so
+# "Set no-think." arrives as "set no think".
+_THINK = r"think(?:ing)?(?: mode)?"
+
+THINK_ON_PATTERNS = (
+    rf"(?:set |turn on |enable |start |use )?(?:the )?{_THINK}",
+    rf"(?:set |turn |switch )?{_THINK} on",
+)
+THINK_OFF_PATTERNS = (
+    rf"(?:set )?no ?{_THINK}",
+    rf"(?:turn off|switch off|disable|stop)(?: the)? {_THINK}",
+    rf"(?:set |turn |switch )?{_THINK} off",
+    r"don t think",
+)
+MODEL_PATTERNS = (
+    r"(?:switch|change|set)(?: the)? model to (?P<model>.+)",
+    r"(?:set|use|load)(?: the)? model (?P<model>.+)",
+)
+# Looser forms; they fall through to the LLM unless the name is a model.
+MODEL_LOOSE_PATTERNS = (
+    r"(?:switch to|use|load) (?P<model>.+)",
+)
+LIST_MODELS_PATTERNS = (
+    r"(?:list|show)(?: the)?(?: available)? models",
+    r"(?:what|which) models (?:are available|are there|do you have|can i use)",
+)
+STATUS_PATTERNS = (
+    r"status",
+    r"what s your status",
+    r"(?:current )?settings",
+    r"(?:what|which) model are you(?: using)?",
+    r"what mode are you in",
+)
+FASTER_PATTERNS = (r"(?:speak|talk)(?: a bit| a little)? faster",)
+SLOWER_PATTERNS = (r"(?:speak|talk)(?: a bit| a little)? slower",)
+NORMAL_SPEED_PATTERNS = (
+    r"(?:speak |talk )?(?:at )?normal speed",
+    r"reset (?:the )?speed",
+)
+HELP_PATTERNS = (
+    r"help",
+    r"what (?:commands|can i say)(?: are there)?",
+    r"(?:list|voice) commands",
+)
+
+
+def spoken_model_name(model):
+    """'qwen3.6:27b' -> 'Qwen 3.6 27B', for reading aloud."""
+
+    name = re.sub(r":latest$", "", model)
+    family, _, size = name.partition(":")
+    family = re.sub(r"(?<=[a-zA-Z])(?=\d)", " ", family).replace("-", " ")
+    family = family[:1].upper() + family[1:]
+
+    return f"{family} {size.upper()}".strip()
+
+
+def _join_spoken(items):
+    items = list(items)
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+_DIM = "\033[2m"
+_RESET = "\033[0m"
 
 
 def print_event(kind, text=""):
@@ -90,6 +189,12 @@ def print_event(kind, text=""):
         print(f"\n[{text}]", flush=True)
     elif kind == "user":
         print(f"\nYOU: {text}", flush=True)
+    elif kind == "thinking_start":
+        print(f"{_DIM}(thinking) ", end="", flush=True)
+    elif kind == "thinking":
+        print(text, end="", flush=True)
+    elif kind == "thinking_end":
+        print(_RESET, flush=True)
     elif kind == "assistant_start":
         print("AI:  ", end="", flush=True)
     elif kind == "assistant_text":
@@ -109,7 +214,8 @@ class VoiceAssistant:
     The three components are passed in, so each can be configured,
     replaced or tested on its own.
 
-    on_event(kind, text) receives: "status", "user", "assistant_start",
+    on_event(kind, text) receives: "status", "user", "thinking_start",
+    "thinking" (streamed reasoning), "thinking_end", "assistant_start",
     "assistant_text" (streamed), "assistant_end", "interrupted", "error".
     """
 
@@ -127,12 +233,14 @@ class VoiceAssistant:
         self.config = config or AssistantConfig()
         self.on_event = on_event
 
-        self._exit_phrases = {_normalize_command(p) for p in self.config.exit_phrases}
-        self._reset_phrases = {_normalize_command(p) for p in self.config.reset_phrases}
+        self.commands = self._build_commands()
+        self._quit = False
 
         # True from the moment a prompt is sent until the reply has been
         # spoken, so the user can interrupt while the LLM is still thinking.
         self._responding = False
+        self._thinking_shown = False
+        self._reply_started = False
 
     # --------------------------------------------------
     # Lifecycle
@@ -143,6 +251,7 @@ class VoiceAssistant:
 
         self._emit("status", f"Connecting to {self.llm.config.base_url}")
         self.llm.check_connection()
+        self._teach_model_names()
 
         # Load the LLM into GPU memory on the server while we load ours.
         threading.Thread(target=self.llm.warm_up, daemon=True).start()
@@ -186,39 +295,38 @@ class VoiceAssistant:
         """Respond to one transcribed prompt. Returns False to quit."""
 
         self._emit("user", text)
-        command = _normalize_command(text)
 
-        if command in self._exit_phrases:
-            self._say(self.config.goodbye)
-            return False
+        reply = self.commands.dispatch(text)
 
-        if command in self._reset_phrases:
-            self.llm.reset()
-            self._say(self.config.reset_reply)
-            return True
+        if reply is NOT_HANDLED:
+            self._respond(text)
+        elif reply:
+            self._say(reply)
 
-        self._respond(text)
-        return True
+        return not self._quit
 
     def _respond(self, text):
 
         self._mute()
         self._responding = True
+        self._thinking_shown = False
+        self._reply_started = False
 
         try:
-            self._emit("assistant_start")
+            if self.llm.config.think and self.config.thinking_cue:
+                # Plays while the model thinks; the reply queues after it.
+                self.speaker.speak(self.config.thinking_cue)
 
-            completed = self.speaker.speak_stream(
-                self._echo(self.llm.stream_reply(text))
-            )
+            tokens = self.llm.stream_reply(text, on_thinking=self._on_thinking)
+            completed = self.speaker.speak_stream(self._echo(tokens))
 
-            self._emit("assistant_end")
+            self._end_reply()
 
             if not completed:
                 self._emit("interrupted")
 
         except LLMError as exc:
-            self._emit("assistant_end")
+            self._end_reply()
             self._emit("error", str(exc))
             logger.debug("LLM error", exc_info=True)
             self.speaker.speak(self.config.error_reply, wait=True)
@@ -245,10 +353,215 @@ class VoiceAssistant:
 
         try:
             for token in tokens:
+                self._start_reply()
                 self._emit("assistant_text", token)
                 yield token
         finally:
             tokens.close()
+
+    def _on_thinking(self, text):
+
+        if not self._thinking_shown:
+            self._thinking_shown = True
+            self._emit("thinking_start")
+
+        if self.config.show_thinking:
+            self._emit("thinking", text)
+
+    def _start_reply(self):
+
+        if self._reply_started:
+            return
+
+        if self._thinking_shown:
+            self._emit("thinking_end")
+
+        self._reply_started = True
+        self._emit("assistant_start")
+
+    def _end_reply(self):
+
+        if self._reply_started:
+            self._emit("assistant_end")
+        elif self._thinking_shown:
+            self._emit("thinking_end")
+
+    # --------------------------------------------------
+    # Voice commands
+    # --------------------------------------------------
+
+    def _build_commands(self):
+
+        router = CommandRouter(prefix=self.config.command_prefix)
+
+        router.add_phrases("exit", self.config.exit_phrases, self._cmd_exit,
+                           "goodbye")
+        router.add_phrases("reset", self.config.reset_phrases, self._cmd_reset,
+                           "new conversation")
+        router.add("think_off", THINK_OFF_PATTERNS,
+                   lambda: self._cmd_think(False), "thinking off")
+        router.add("think_on", THINK_ON_PATTERNS,
+                   lambda: self._cmd_think(True), "thinking on")
+        router.add("list_models", LIST_MODELS_PATTERNS, self._cmd_list_models,
+                   "list models")
+        router.add("switch_model", MODEL_PATTERNS,
+                   lambda model: self._cmd_switch_model(model, strict=True),
+                   "switch model to, followed by a name")
+        router.add("switch_model_loose", MODEL_LOOSE_PATTERNS,
+                   lambda model: self._cmd_switch_model(model, strict=False))
+        router.add("status", STATUS_PATTERNS, self._cmd_status, "status")
+        router.add("faster", FASTER_PATTERNS, lambda: self._cmd_speed(+1),
+                   "speak faster")
+        router.add("slower", SLOWER_PATTERNS, lambda: self._cmd_speed(-1),
+                   "speak slower")
+        router.add("normal_speed", NORMAL_SPEED_PATTERNS,
+                   lambda: self._cmd_speed(0), "normal speed")
+        router.add("help", HELP_PATTERNS, self._cmd_help, "help")
+
+        return router
+
+    def _cmd_exit(self):
+        self._quit = True
+        return self.config.goodbye
+
+    def _cmd_reset(self):
+        self.llm.reset()
+        return self.config.reset_reply
+
+    def _cmd_think(self, on):
+
+        model = spoken_model_name(self.llm.config.model)
+
+        if on == self.llm.config.think:
+            return f"Thinking is already {'on' if on else 'off'}."
+
+        if on:
+            try:
+                supported = self.llm.supports_thinking()
+            except LLMError:
+                supported = None  # unknown; let the server decide
+
+            if supported is False:
+                return f"{model} doesn't support thinking."
+
+        self.llm.config.think = on
+        self._emit("status", f"thinking {'on' if on else 'off'}")
+
+        if on:
+            return "Thinking on. Replies will take longer."
+        return "Thinking off."
+
+    def _cmd_switch_model(self, model, strict):
+
+        try:
+            models = self.llm.list_models()
+        except LLMError:
+            return self.config.error_reply
+
+        resolved = self.llm.resolve_model(model, models)
+
+        if resolved is None:
+            if not strict:
+                return NOT_HANDLED
+            return (
+                f"I couldn't find a model called {model}. Available models "
+                f"are {_join_spoken(spoken_model_name(m) for m in models)}."
+            )
+
+        name = spoken_model_name(resolved)
+
+        if resolved == self.llm.config.model:
+            return f"I'm already using {name}."
+
+        self.llm.config.model = resolved
+        self._emit("status", f"model: {resolved}")
+        threading.Thread(target=self.llm.warm_up, daemon=True).start()
+
+        reply = f"Switched to {name}."
+
+        if self.llm.config.think:
+            try:
+                supported = self.llm.supports_thinking()
+            except LLMError:
+                supported = None
+
+            if supported is False:
+                self.llm.config.think = False
+                reply += " It doesn't support thinking, so thinking is off."
+
+        return reply
+
+    def _cmd_list_models(self):
+
+        try:
+            models = self.llm.list_models()
+        except LLMError:
+            return self.config.error_reply
+
+        names = _join_spoken(spoken_model_name(m) for m in models)
+        current = spoken_model_name(self.llm.config.model)
+
+        return f"Available models are {names}. I'm using {current}."
+
+    def _cmd_status(self):
+
+        return (
+            f"I'm using {spoken_model_name(self.llm.config.model)}, "
+            f"thinking is {'on' if self.llm.config.think else 'off'}, "
+            f"and my speaking speed is {self.speaker.config.speed:.1f}."
+        )
+
+    def _cmd_speed(self, direction):
+
+        config = self.speaker.config
+
+        if direction == 0:
+            config.speed = 1.0
+            return "Back to normal speed."
+
+        speed = round(config.speed + direction * self.config.speed_step, 2)
+        speed = min(2.0, max(0.5, speed))
+
+        if speed == config.speed:
+            return f"That's as {'fast' if direction > 0 else 'slow'} as I go."
+
+        config.speed = speed
+        return f"Okay, speaking {'faster' if direction > 0 else 'slower'}."
+
+    def _cmd_help(self):
+
+        prefix = (
+            f"Start commands with {self.config.command_prefix}. "
+            if self.config.command_prefix else ""
+        )
+        return (
+            f"{prefix}You can say: "
+            f"{_join_spoken(self.commands.descriptions())}."
+        )
+
+    def _teach_model_names(self):
+        """Help Whisper spell model names, e.g. 'Qwen' rather than 'Quinn'."""
+
+        recognizer_config = getattr(self.recognizer, "config", None)
+
+        if (
+            not self.config.model_names_as_vocabulary
+            or recognizer_config is None
+            or recognizer_config.hotwords
+        ):
+            return
+
+        try:
+            models = self.llm.list_models()
+        except LLMError:
+            return
+
+        families = sorted({
+            spoken_model_name(m).split(" ")[0] for m in models
+        })
+
+        if families:
+            recognizer_config.hotwords = ", ".join(families)
 
     # --------------------------------------------------
     # Microphone handling
@@ -328,6 +641,9 @@ def parse_args(argv=None):
     parser.add_argument("--interruptible", action="store_true",
                         help="talk over the assistant to interrupt it "
                              "(use headphones)")
+    parser.add_argument("--command-prefix", default=None,
+                        help="wake word required before voice commands, "
+                             "e.g. 'computer'")
     parser.add_argument("--list-devices", action="store_true",
                         help="list microphones and speakers, then exit")
     parser.add_argument("--debug", action="store_true",
@@ -392,7 +708,10 @@ def main(argv=None):
         recognizer,
         speaker,
         llm,
-        AssistantConfig(interruptible=args.interruptible),
+        AssistantConfig(
+            interruptible=args.interruptible,
+            command_prefix=args.command_prefix,
+        ),
     )
 
     try:

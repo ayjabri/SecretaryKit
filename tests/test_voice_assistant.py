@@ -14,12 +14,18 @@ import sys
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 
 # Make the project root importable when run as "python tests/<file>.py".
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from voicekit.llm_client import LLMError
-from voice_assistant import AssistantConfig, VoiceAssistant, parse_args
+from voicekit.llm_client import LLMClient, LLMError
+from voice_assistant import (
+    AssistantConfig,
+    VoiceAssistant,
+    parse_args,
+    spoken_model_name,
+)
 
 
 def _take_flag(flag):
@@ -44,6 +50,7 @@ class FakeRecognizer:
         self.prompts = list(prompts)
         self.log = log
         self.on_speech_start = None
+        self.config = SimpleNamespace(hotwords=None)
 
     def load(self):
         self.log.append("recognizer.load")
@@ -70,6 +77,7 @@ class FakeSpeaker:
         self.spoken = []
         self.generation = 0
         self.is_speaking = False
+        self.config = SimpleNamespace(speed=1.0)
 
     def load(self):
         self.log.append("speaker.load")
@@ -107,25 +115,49 @@ class FakeSpeaker:
 
 
 class FakeLLM:
+    """
+    Replies are strings, exceptions to raise, or (thinking, reply) pairs.
+    Models in THINKING_MODELS support thinking.
+    """
+
+    MODELS = ["qwen3.5:4b", "qwen3.6:27b", "llama3.1:8b"]
+    THINKING_MODELS = {"qwen3.5:4b", "qwen3.6:27b"}
 
     def __init__(self, replies, log):
         self.replies = list(replies)
         self.log = log
         self.prompts = []
         self.resets = 0
-        self.config = type("C", (), {"base_url": "http://fake"})()
+        self.warmed_up = []
+        self.config = SimpleNamespace(
+            base_url="http://fake", model="qwen3.5:4b", think=False
+        )
 
     def check_connection(self):
         self.log.append("llm.check")
 
     def warm_up(self):
-        pass
+        self.warmed_up.append(self.config.model)
 
-    def stream_reply(self, text):
+    def list_models(self):
+        return list(self.MODELS)
+
+    def supports_thinking(self, model=None):
+        return (model or self.config.model) in self.THINKING_MODELS
+
+    def resolve_model(self, spoken_name, models=None):
+        return LLMClient.resolve_model(self, spoken_name, models)
+
+    def stream_reply(self, text, on_thinking=None):
         self.prompts.append(text)
         reply = self.replies.pop(0)
         if isinstance(reply, Exception):
             raise reply
+        if isinstance(reply, tuple):
+            thinking, reply = reply
+            if on_thinking:
+                for word in thinking.split(" "):
+                    on_thinking(word + " ")
         for word in reply.split(" "):
             yield word + " "
 
@@ -272,9 +304,9 @@ class InterruptTests(unittest.TestCase):
         closed = threading.Event()
         original = llm.stream_reply
 
-        def tracked(text):
+        def tracked(text, **kwargs):
             try:
-                yield from original(text)
+                yield from original(text, **kwargs)
             finally:
                 closed.set()
 
@@ -304,20 +336,245 @@ class InterruptTests(unittest.TestCase):
         self.assertNotIn("stop", log)
 
 
+class ThinkingCommandTests(unittest.TestCase):
+
+    def test_set_think_turns_thinking_on_without_asking_llm(self):
+        assistant, _, speaker, llm, _, _ = make_assistant(["Set think."])
+
+        assistant.run()
+
+        self.assertTrue(llm.config.think)
+        self.assertEqual(llm.prompts, [])
+        self.assertEqual(speaker.spoken, ["Thinking on. Replies will take longer."])
+
+    def test_spoken_variants(self):
+        for said, expected in [
+            ("Set think.", True), ("Thinking mode on", True),
+            ("Turn on thinking.", True), ("Enable thinking", True),
+            ("Set no-think.", False), ("Set nothink", False),
+            ("Thinking off.", False), ("Stop thinking!", False),
+            ("Turn off thinking mode", False), ("Don't think.", False),
+        ]:
+            with self.subTest(said=said):
+                assistant, _, _, llm, _, _ = make_assistant([said])
+                llm.config.think = not expected
+
+                assistant.run()
+
+                self.assertEqual(llm.config.think, expected)
+                self.assertEqual(llm.prompts, [])
+
+    def test_questions_about_thinking_go_to_llm(self):
+        assistant, _, _, llm, _, _ = make_assistant(
+            ["How do I stop thinking about work?"], ["Take a walk."]
+        )
+
+        assistant.run()
+
+        self.assertFalse(llm.config.think)
+        self.assertEqual(llm.prompts, ["How do I stop thinking about work?"])
+
+    def test_already_on(self):
+        assistant, _, speaker, llm, _, _ = make_assistant(["Set think."])
+        llm.config.think = True
+
+        assistant.run()
+
+        self.assertEqual(speaker.spoken, ["Thinking is already on."])
+
+    def test_refused_for_model_without_thinking(self):
+        assistant, _, speaker, llm, _, _ = make_assistant(["Set think."])
+        llm.config.model = "llama3.1:8b"
+
+        assistant.run()
+
+        self.assertFalse(llm.config.think)
+        self.assertEqual(speaker.spoken, ["Llama 3.1 8B doesn't support thinking."])
+
+    def test_thinking_reply_cue_and_events(self):
+        assistant, _, speaker, llm, _, events = make_assistant(
+            ["Set think.", "What is 17 times 23?"],
+            [("Let me compute.", "It is 391.")],
+        )
+
+        assistant.run()
+
+        self.assertEqual(speaker.spoken[1], "Let me think about that.")
+        self.assertEqual(speaker.spoken[2].strip(), "It is 391.")
+
+        kinds = [k for k, _ in events if k != "assistant_text"]
+        last_user = len(kinds) - 1 - kinds[::-1].index("user")
+        reply_kinds = kinds[last_user:]
+        self.assertEqual(reply_kinds[:4], ["user", "thinking_start", "thinking", "thinking"])
+        self.assertEqual(reply_kinds[-3:], ["thinking_end", "assistant_start", "assistant_end"])
+
+        thoughts = "".join(t for k, t in events if k == "thinking")
+        self.assertEqual(thoughts.strip(), "Let me compute.")
+
+    def test_thinking_text_can_be_hidden(self):
+        assistant, _, _, llm, _, events = make_assistant(
+            ["Hi"], [("secret plan", "Hello.")], show_thinking=False,
+        )
+        llm.config.think = True
+
+        assistant.run()
+
+        kinds = [k for k, _ in events]
+        self.assertIn("thinking_start", kinds)
+        self.assertNotIn("thinking", kinds)
+
+    def test_no_cue_when_thinking_off(self):
+        assistant, _, speaker, _, _, _ = make_assistant(["Hi"], ["Hello."])
+
+        assistant.run()
+
+        self.assertNotIn("Let me think about that.", speaker.spoken)
+
+
+class ModelCommandTests(unittest.TestCase):
+
+    def test_switch_model_keeps_history(self):
+        assistant, _, speaker, llm, _, _ = make_assistant(
+            ["Switch model to Qwen 3.6."]
+        )
+
+        assistant.run()
+
+        self.assertEqual(llm.config.model, "qwen3.6:27b")
+        self.assertEqual(llm.resets, 0)
+        self.assertEqual(llm.warmed_up[-1], "qwen3.6:27b")
+        self.assertEqual(speaker.spoken, ["Switched to Qwen 3.6 27B."])
+
+    def test_misheard_model_name(self):
+        assistant, _, _, llm, _, _ = make_assistant(["Use Quinn three point six."])
+
+        assistant.run()
+
+        self.assertEqual(llm.config.model, "qwen3.6:27b")
+
+    def test_unknown_model_lists_alternatives(self):
+        assistant, _, speaker, llm, _, _ = make_assistant(["Switch model to Mistral."])
+
+        assistant.run()
+
+        self.assertEqual(llm.config.model, "qwen3.5:4b")
+        self.assertIn("couldn't find", speaker.spoken[0])
+        self.assertIn("Qwen 3.6 27B", speaker.spoken[0])
+
+    def test_use_something_else_goes_to_llm(self):
+        assistant, _, _, llm, _, _ = make_assistant(
+            ["Use Python to sort a list."], ["Call sorted."]
+        )
+
+        assistant.run()
+
+        self.assertEqual(llm.config.model, "qwen3.5:4b")
+        self.assertEqual(llm.prompts, ["Use Python to sort a list."])
+
+    def test_switch_to_model_without_thinking_turns_it_off(self):
+        assistant, _, speaker, llm, _, _ = make_assistant(["Switch model to Llama."])
+        llm.config.think = True
+
+        assistant.run()
+
+        self.assertEqual(llm.config.model, "llama3.1:8b")
+        self.assertFalse(llm.config.think)
+        self.assertIn("thinking is off", speaker.spoken[0])
+
+    def test_list_models_and_status(self):
+        assistant, _, speaker, llm, _, _ = make_assistant(["List models.", "Status."])
+        llm.config.think = True
+
+        assistant.run()
+
+        self.assertEqual(
+            speaker.spoken[0],
+            "Available models are Qwen 3.5 4B, Qwen 3.6 27B and Llama 3.1 8B. "
+            "I'm using Qwen 3.5 4B.",
+        )
+        self.assertEqual(
+            speaker.spoken[1],
+            "I'm using Qwen 3.5 4B, thinking is on, and my speaking speed is 1.0.",
+        )
+
+    def test_model_names_taught_to_whisper(self):
+        assistant, recognizer, _, _, _, _ = make_assistant([])
+
+        assistant.run()
+
+        self.assertEqual(recognizer.config.hotwords, "Llama, Qwen")
+
+    def test_user_vocabulary_not_overwritten(self):
+        assistant, recognizer, _, _, _, _ = make_assistant([])
+        recognizer.config.hotwords = "Kubernetes"
+
+        assistant.run()
+
+        self.assertEqual(recognizer.config.hotwords, "Kubernetes")
+
+
+class OtherCommandTests(unittest.TestCase):
+
+    def test_speaking_speed(self):
+        assistant, _, speaker, _, _, _ = make_assistant(
+            ["Speak faster.", "Speak faster.", "Talk a bit slower.", "Normal speed."]
+        )
+        speeds = []
+        assistant.speaker.speak = lambda text, wait=False: speeds.append(
+            speaker.config.speed
+        )
+
+        assistant.run()
+
+        self.assertEqual(speeds, [1.1, 1.2, 1.1, 1.0])
+
+    def test_speed_limits(self):
+        assistant, _, speaker, _, _, _ = make_assistant(["Speak faster."])
+        speaker.config.speed = 2.0
+
+        assistant.run()
+
+        self.assertEqual(speaker.spoken, ["That's as fast as I go."])
+
+    def test_help_lists_commands(self):
+        assistant, _, speaker, _, _, _ = make_assistant(["Help."])
+
+        assistant.run()
+
+        for phrase in ("thinking on", "thinking off", "switch model", "goodbye"):
+            self.assertIn(phrase, speaker.spoken[0])
+
+    def test_command_prefix(self):
+        assistant, _, _, llm, _, _ = make_assistant(
+            ["Set think.", "Computer, set think."], ["Sure."],
+            command_prefix="computer",
+        )
+
+        assistant.run()
+
+        self.assertEqual(llm.prompts, ["Set think."])
+        self.assertTrue(llm.config.think)
+
+    def test_spoken_model_name(self):
+        self.assertEqual(spoken_model_name("qwen3.6:27b"), "Qwen 3.6 27B")
+        self.assertEqual(spoken_model_name("qwen2.5-coder:latest"), "Qwen 2.5 coder")
+        self.assertEqual(spoken_model_name("mistral"), "Mistral")
+
+
 class CommandLineTests(unittest.TestCase):
 
     def test_defaults(self):
         args = parse_args([])
 
         self.assertEqual(args.host, "http://10.0.0.100:11434")
-        self.assertEqual(args.model, "qwen3:8b")
+        self.assertEqual(args.model, "qwen3.5:4b")
         self.assertFalse(args.interruptible)
 
     def test_options(self):
-        args = parse_args(["--model", "qwen3:14b", "--voice", "bf_emma",
+        args = parse_args(["--model", "qwen3.6:27b", "--voice", "bf_emma",
                            "--interruptible", "--pause", "2"])
 
-        self.assertEqual(args.model, "qwen3:14b")
+        self.assertEqual(args.model, "qwen3.6:27b")
         self.assertEqual(args.voice, "bf_emma")
         self.assertTrue(args.interruptible)
         self.assertEqual(args.pause, 2.0)
