@@ -20,7 +20,7 @@ import httpx
 # Make the project root importable when run as "python tests/<file>.py".
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from voicekit.llm_client import LLMClient, LLMConfig, LLMError, _ThinkFilter
+from voicekit.llm_client import LLMClient, LLMConfig, LLMError, ToolCall, _ThinkFilter
 
 
 def _take_flag(flag):
@@ -203,7 +203,7 @@ class OllamaTests(unittest.TestCase):
     def test_check_connection_reports_missing_model(self):
         client = make_client(FakeServer(models=["llama3:8b"]), model="qwen3.5:4b")
 
-        with self.assertRaisesRegex(LLMError, "qwen3\.5:4b.*llama3:8b"):
+        with self.assertRaisesRegex(LLMError, r"qwen3.5:4b.*llama3:8b"):
             client.check_connection()
 
     def test_history_trimmed(self):
@@ -277,6 +277,179 @@ class ThinkingTests(unittest.TestCase):
         reply = "".join(client.stream_reply("Q", on_thinking=thoughts.append))
 
         self.assertEqual((reply, thoughts), ("Yes.", ["hmm"]))
+
+
+def ollama_tool_call_lines(*calls):
+    message = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"function": {"name": name, "arguments": args}} for name, args in calls
+        ],
+    }
+    lines = [{"message": message, "done": False},
+             {"message": {"content": ""}, "done": True}]
+    return "\n".join(json.dumps(line) for line in lines) + "\n"
+
+
+STATUS_TOOL = {"type": "function", "function": {
+    "name": "get_status", "description": "Report settings.",
+    "parameters": {"type": "object", "properties": {}},
+}}
+
+
+class ToolCallTests(unittest.TestCase):
+
+    def test_tool_results_sent_back_and_model_continues(self):
+        server = FakeServer([
+            ollama_tool_call_lines(("get_status", {})),
+            ollama_lines("You're on Qwen."),
+        ])
+        client = make_client(server, system_prompt=None)
+        seen = []
+
+        def on_tool_calls(calls):
+            seen.extend(calls)
+            return ["Model: qwen3.5:4b."]
+
+        reply = "".join(client.stream_reply(
+            "What model is this?", tools=[STATUS_TOOL], on_tool_calls=on_tool_calls,
+        ))
+
+        self.assertEqual(reply, "You're on Qwen.")
+        self.assertEqual([(c.name, c.arguments) for c in seen], [("get_status", {})])
+
+        first, second = server.chat_bodies()
+        self.assertEqual(first["tools"], [STATUS_TOOL])
+        self.assertEqual(second["messages"][-1],
+                         {"role": "tool", "tool_name": "get_status",
+                          "content": "Model: qwen3.5:4b."})
+        self.assertEqual([m["role"] for m in client.history],
+                         ["user", "assistant", "tool", "assistant"])
+        self.assertEqual(client.pending_tool_calls, [])
+
+    def test_returning_none_leaves_calls_pending(self):
+        server = FakeServer([
+            ollama_tool_call_lines(("set_thinking", {"enabled": True})),
+        ])
+        client = make_client(server)
+
+        reply = "".join(client.stream_reply(
+            "Think harder", tools=[STATUS_TOOL], on_tool_calls=lambda calls: None,
+        ))
+
+        self.assertEqual(reply, "")
+        self.assertEqual(len(server.chat_bodies()), 1)
+        self.assertEqual(client.pending_tool_calls[0].arguments, {"enabled": True})
+        self.assertEqual(client.history[-1]["tool_calls"][0]["function"]["name"],
+                         "set_thinking")
+
+        client.add_tool_results(["Thinking on."])
+
+        self.assertEqual(client.history[-1]["content"], "Thinking on.")
+        self.assertEqual(client.pending_tool_calls, [])
+
+    def test_next_message_cancels_unanswered_calls(self):
+        server = FakeServer([
+            ollama_tool_call_lines(("set_thinking", {"enabled": True})),
+            ollama_lines("Tokyo."),
+        ])
+        client = make_client(server, system_prompt=None)
+
+        list(client.stream_reply("Think harder", tools=[STATUS_TOOL],
+                                 on_tool_calls=lambda calls: None))
+        client.chat("Capital of Japan?")
+
+        messages = server.chat_bodies()[1]["messages"]
+        self.assertEqual([m["role"] for m in messages],
+                         ["user", "assistant", "tool", "user"])
+        self.assertIn("did not confirm", messages[2]["content"])
+
+    def test_without_handler_calls_stay_pending(self):
+        client = make_client(FakeServer([ollama_tool_call_lines(("get_status", {}))]))
+
+        list(client.stream_reply("Status?", tools=[STATUS_TOOL]))
+
+        self.assertEqual(len(client.pending_tool_calls), 1)
+
+    def test_last_round_offers_no_tools(self):
+        server = FakeServer([
+            ollama_tool_call_lines(("get_status", {})),
+            ollama_tool_call_lines(("get_status", {})),
+            ollama_lines("Done."),
+        ])
+        client = make_client(server, max_tool_rounds=2)
+
+        reply = "".join(client.stream_reply(
+            "Status?", tools=[STATUS_TOOL], on_tool_calls=lambda c: ["ok"],
+        ))
+
+        self.assertEqual(reply, "Done.")
+        self.assertEqual([("tools" in b) for b in server.chat_bodies()],
+                         [True, True, False])
+
+    def test_failure_after_tool_call_forgets_whole_turn(self):
+        server = FakeServer([
+            ollama_tool_call_lines(("get_status", {})),
+            httpx.Response(500, json={"error": "out of memory"}),
+        ])
+        client = make_client(server)
+
+        with self.assertRaisesRegex(LLMError, "out of memory"):
+            list(client.stream_reply("Status?", tools=[STATUS_TOOL],
+                                     on_tool_calls=lambda c: ["ok"]))
+
+        self.assertEqual(client.history, [])
+        self.assertEqual(client.pending_tool_calls, [])
+
+    def test_reset_during_tool_call_is_safe(self):
+        server = FakeServer([ollama_tool_call_lines(("new_conversation", {}))])
+        client = make_client(server)
+        client.history = [{"role": "user", "content": "old"},
+                          {"role": "assistant", "content": "old reply"}]
+
+        def reset(calls):
+            client.reset()
+            return None
+
+        list(client.stream_reply("Start over", tools=[STATUS_TOOL],
+                                 on_tool_calls=reset))
+
+        self.assertEqual(client.history, [])
+
+    def test_add_tool_results_checks_count(self):
+        client = make_client(FakeServer())
+        client.pending_tool_calls = [ToolCall("a", {}), ToolCall("b", {})]
+
+        with self.assertRaises(ValueError):
+            client.add_tool_results(["only one"])
+
+    def test_openai_fragmented_tool_calls(self):
+        events = [
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_9",
+                "function": {"name": "set_thinking", "arguments": '{"ena'}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0,
+                "function": {"arguments": 'bled": true}'}}]}}]},
+        ]
+        body = "\n\n".join("data: " + json.dumps(e) for e in events) + "\n\ndata: [DONE]\n\n"
+        server = FakeServer([body, openai_lines("Done.")])
+        client = make_client(server, api="openai", system_prompt=None)
+        seen = []
+
+        reply = "".join(client.stream_reply(
+            "Think harder", tools=[STATUS_TOOL],
+            on_tool_calls=lambda calls: seen.extend(calls) or ["Thinking on."],
+        ))
+
+        self.assertEqual(reply, "Done.")
+        self.assertEqual((seen[0].id, seen[0].name, seen[0].arguments),
+                         ("call_9", "set_thinking", {"enabled": True}))
+
+        messages = server.requests[-1][1]["messages"]
+        self.assertEqual(messages[1]["tool_calls"][0]["function"]["arguments"],
+                         '{"enabled": true}')
+        self.assertEqual(messages[2], {"role": "tool", "tool_call_id": "call_9",
+                                       "content": "Thinking on."})
 
 
 class ModelInfoTests(unittest.TestCase):

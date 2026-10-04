@@ -23,6 +23,8 @@ from typing import Iterator, Optional
 
 import httpx
 
+from .agent import AgentError
+
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +47,7 @@ question if the meaning is unclear.\
 """
 
 
-class LLMError(RuntimeError):
+class LLMError(AgentError):
     """The LLM server could not be reached or returned an error."""
 
 
@@ -91,6 +93,10 @@ class LLMConfig:
 
     options
         Extra model options, e.g. {"num_ctx": 8192} for Ollama.
+
+    max_tool_rounds
+        How many times one reply may call tools and continue with the
+        results before the model must answer in words.
     """
 
     base_url: str = "http://10.0.0.100:11434"
@@ -105,6 +111,7 @@ class LLMConfig:
     connect_timeout: float = 5.0
     read_timeout: float = 120.0
     options: dict = field(default_factory=dict)
+    max_tool_rounds: int = 3
 
     def __post_init__(self):
         self.base_url = self.base_url.rstrip("/")
@@ -114,6 +121,18 @@ class LLMConfig:
 
         if self.max_history_messages < 2:
             raise ValueError("max_history_messages must be >= 2")
+
+        if self.max_tool_rounds < 1:
+            raise ValueError("max_tool_rounds must be >= 1")
+
+
+@dataclass
+class ToolCall:
+    """A function call requested by the model."""
+
+    name: str
+    arguments: dict
+    id: Optional[str] = None
 
 
 # How speech recognition tends to spell model names.
@@ -152,6 +171,21 @@ def _compact_name(name):
     """
     name = re.sub(r":latest$", "", name.lower().strip())
     return re.sub(r"[^a-z0-9]", "", name)
+
+
+def _parse_arguments(arguments):
+    """Tool arguments arrive as a dict (Ollama) or a JSON string (OpenAI)."""
+
+    if isinstance(arguments, dict):
+        return arguments
+
+    try:
+        parsed = json.loads(arguments or "{}")
+    except ValueError:
+        logger.warning("Unparseable tool arguments: %r", arguments)
+        return {}
+
+    return parsed if isinstance(parsed, dict) else {}
 
 
 class _ThinkFilter:
@@ -233,6 +267,10 @@ class LLMClient:
 
         self.history = []
 
+        # Tool calls from the last reply that are waiting for results
+        # (e.g. while the user is asked to confirm them).
+        self.pending_tool_calls = []
+
     # --------------------------------------------------
     # Lifecycle
     # --------------------------------------------------
@@ -249,6 +287,7 @@ class LLMClient:
     def reset(self):
         """Forget the conversation."""
         self.history = []
+        self.pending_tool_calls = []
 
     # --------------------------------------------------
     # Server checks
@@ -366,7 +405,9 @@ class LLMClient:
     # Chat
     # --------------------------------------------------
 
-    def stream_reply(self, user_text, on_thinking=None) -> Iterator[str]:
+    def stream_reply(
+        self, user_text, on_thinking=None, tools=None, on_tool_calls=None
+    ) -> Iterator[str]:
         """
         Send a user message and yield the reply as it streams in.
 
@@ -375,23 +416,31 @@ class LLMClient:
             streams (when `think` is on). Reasoning is never yielded as
             part of the reply or kept in the history.
 
+        tools
+            Tool definitions the model may call, in the format shared by
+            Ollama and OpenAI: {"type": "function", "function": {"name",
+            "description", "parameters"}}.
+
+        on_tool_calls
+            Called with a list of ToolCall when the model calls tools.
+            Return one result string per call to send them back, and the
+            model continues its answer with them. Return None to end the
+            reply there: the calls stay in `pending_tool_calls` until
+            add_tool_results() is called (e.g. once the user confirms).
+
         The exchange is added to the history when the stream ends. If the
         caller stops early (e.g. the user interrupted), the partial reply
         is kept so the model knows what was actually said.
 
-        Raises LLMError on connection or server errors; the user message
-        is then removed from the history so it can be retried.
+        Raises LLMError on connection or server errors; everything from
+        this turn is then removed from the history so it can be retried.
         """
+
+        self.cancel_pending_tool_calls()
 
         user_message = {"role": "user", "content": user_text}
         self.history.append(user_message)
         self._trim_history()
-
-        messages = list(self.history)
-        if self.config.system_prompt:
-            messages.insert(
-                0, {"role": "system", "content": self.config.system_prompt}
-            )
 
         def thinking(text):
             if on_thinking is None:
@@ -401,28 +450,53 @@ class LLMClient:
             except Exception:
                 logger.exception("on_thinking callback failed")
 
-        stream = (
-            self._stream_ollama(messages, thinking)
-            if self.config.api == "ollama"
-            else self._stream_openai(messages, thinking)
-        )
-
-        think_filter = _ThinkFilter()
         reply = []
         completed = False
         failed = False
 
         try:
-            for token in stream:
-                text = think_filter.feed(token)
-                if text:
-                    reply.append(text)
-                    yield text
+            for round_index in range(self.config.max_tool_rounds + 1):
+                # The last round offers no tools, so the model must answer.
+                offered = tools if round_index < self.config.max_tool_rounds else None
+                reply = []
+                calls = []
+                think_filter = _ThinkFilter()
+                stream = self._stream(self._messages(), thinking, offered)
 
-            text = think_filter.flush()
-            if text:
-                reply.append(text)
-                yield text
+                try:
+                    for item in stream:
+                        if isinstance(item, ToolCall):
+                            calls.append(item)
+                            continue
+
+                        text = think_filter.feed(item)
+                        if text:
+                            reply.append(text)
+                            yield text
+
+                    text = think_filter.flush()
+                    if text:
+                        reply.append(text)
+                        yield text
+                finally:
+                    stream.close()
+
+                if not calls:
+                    break
+
+                logger.debug("Tool calls: %s", calls)
+                self.history.append(
+                    self._tool_call_message("".join(reply).strip(), calls)
+                )
+                self.pending_tool_calls = calls
+                reply = []
+
+                results = on_tool_calls(calls) if on_tool_calls else None
+
+                if results is None:
+                    break
+
+                self.add_tool_results(results)
 
             completed = True
 
@@ -435,24 +509,77 @@ class LLMClient:
             raise
 
         finally:
-            stream.close()
-
-            content = "".join(reply).strip()
-
-            if self.history and self.history[-1] is user_message:
-                if failed or not content:
-                    # Forget the question so it can simply be asked again.
-                    self.history.pop()
-                else:
-                    if not completed:
-                        content += " ..."
-                    self.history.append(
-                        {"role": "assistant", "content": content}
-                    )
+            self._finish_turn(
+                user_message, "".join(reply).strip(), completed, failed
+            )
 
     def chat(self, user_text):
         """Send a message and return the complete reply."""
         return "".join(self.stream_reply(user_text)).strip()
+
+    def add_tool_results(self, results):
+        """
+        Answer `pending_tool_calls`, one result string per call, in order.
+        The model sees them in its next turn.
+        """
+
+        calls = self.pending_tool_calls
+
+        if len(results) != len(calls):
+            raise ValueError(
+                f"expected {len(calls)} tool results, got {len(results)}"
+            )
+
+        for call, result in zip(calls, results):
+            self.history.append(self._tool_result_message(call, str(result)))
+
+        self.pending_tool_calls = []
+
+    def cancel_pending_tool_calls(self):
+        """Tell the model its pending tool calls were not run."""
+
+        if self.pending_tool_calls:
+            self.add_tool_results(
+                ["Not run: the user did not confirm it."]
+                * len(self.pending_tool_calls)
+            )
+
+    def _finish_turn(self, user_message, content, completed, failed):
+
+        index = next(
+            (i for i, m in enumerate(self.history) if m is user_message),
+            None,
+        )
+
+        if index is None:
+            # The history was reset during the turn (e.g. by a tool).
+            return
+
+        if failed:
+            # Forget the whole turn so the question can be asked again.
+            del self.history[index:]
+            self.pending_tool_calls = []
+            return
+
+        if content:
+            if not completed:
+                content += " ..."
+            self.history.append({"role": "assistant", "content": content})
+
+        elif len(self.history) == index + 1:
+            # Nothing was said and no tools were called.
+            self.history.pop()
+
+    def _messages(self):
+
+        messages = list(self.history)
+
+        if self.config.system_prompt:
+            messages.insert(
+                0, {"role": "system", "content": self.config.system_prompt}
+            )
+
+        return messages
 
     def _trim_history(self):
 
@@ -461,7 +588,8 @@ class LLMClient:
         if excess > 0:
             self.history = self.history[excess:]
 
-        # Never start the history with an orphaned assistant message.
+        # Never start the history with an orphaned assistant or tool
+        # message.
         while self.history and self.history[0]["role"] != "user":
             self.history.pop(0)
 
@@ -469,7 +597,49 @@ class LLMClient:
     # Protocols
     # --------------------------------------------------
 
-    def _stream_ollama(self, messages, on_thinking):
+    def _stream(self, messages, on_thinking, tools):
+
+        if self.config.api == "ollama":
+            return self._stream_ollama(messages, on_thinking, tools)
+
+        return self._stream_openai(messages, on_thinking, tools)
+
+    def _tool_call_message(self, content, calls):
+
+        if self.config.api == "ollama":
+            return {
+                "role": "assistant",
+                "content": content,
+                "tool_calls": [
+                    {"function": {"name": c.name, "arguments": c.arguments}}
+                    for c in calls
+                ],
+            }
+
+        return {
+            "role": "assistant",
+            "content": content or None,
+            "tool_calls": [
+                {
+                    "id": c.id,
+                    "type": "function",
+                    "function": {
+                        "name": c.name,
+                        "arguments": json.dumps(c.arguments),
+                    },
+                }
+                for c in calls
+            ],
+        }
+
+    def _tool_result_message(self, call, result):
+
+        if self.config.api == "ollama":
+            return {"role": "tool", "tool_name": call.name, "content": result}
+
+        return {"role": "tool", "tool_call_id": call.id, "content": result}
+
+    def _stream_ollama(self, messages, on_thinking, tools=None):
 
         body = {
             "model": self.config.model,
@@ -480,6 +650,9 @@ class LLMClient:
             "options": {"temperature": self.config.temperature,
                         **self.config.options},
         }
+
+        if tools:
+            body["tools"] = tools
 
         with self._http.stream("POST", "/api/chat", json=body) as response:
             self._raise_for_status(response)
@@ -501,10 +674,18 @@ class LLMClient:
                 if message.get("content"):
                     yield message["content"]
 
+                for call in message.get("tool_calls") or []:
+                    function = call.get("function") or {}
+                    yield ToolCall(
+                        name=function.get("name", ""),
+                        arguments=_parse_arguments(function.get("arguments")),
+                        id=call.get("id"),
+                    )
+
                 if data.get("done"):
                     return
 
-    def _stream_openai(self, messages, on_thinking):
+    def _stream_openai(self, messages, on_thinking, tools=None):
 
         body = {
             "model": self.config.model,
@@ -513,6 +694,12 @@ class LLMClient:
             "temperature": self.config.temperature,
             **self.config.options,
         }
+
+        if tools:
+            body["tools"] = tools
+
+        # Tool calls arrive in fragments, keyed by index.
+        partial_calls = {}
 
         with self._http.stream(
             "POST", "/v1/chat/completions", json=body
@@ -526,7 +713,7 @@ class LLMClient:
                 payload = line[len("data:"):].strip()
 
                 if payload == "[DONE]":
-                    return
+                    break
 
                 data = json.loads(payload)
 
@@ -545,6 +732,23 @@ class LLMClient:
 
                     if delta.get("content"):
                         yield delta["content"]
+
+                    for fragment in delta.get("tool_calls") or []:
+                        call = partial_calls.setdefault(
+                            fragment.get("index", 0),
+                            {"id": None, "name": "", "arguments": ""},
+                        )
+                        function = fragment.get("function") or {}
+                        call["id"] = fragment.get("id") or call["id"]
+                        call["name"] += function.get("name") or ""
+                        call["arguments"] += function.get("arguments") or ""
+
+        for index, call in sorted(partial_calls.items()):
+            yield ToolCall(
+                name=call["name"],
+                arguments=_parse_arguments(call["arguments"]),
+                id=call["id"] or f"call_{index}",
+            )
 
     @staticmethod
     def _raise_for_status(response):

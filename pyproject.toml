@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voicekit"
-version = "0.1.0"
-description = "Local speech-to-text (Whisper), text-to-speech (Kokoro) and streaming LLM chat for voice interfaces."
+version = "0.2.0"
+description = "Talk to any AI agent by voice: local Whisper speech-to-text and Kokoro text-to-speech, with adapters for Ollama, OpenAI-compatible servers, Claude, LangGraph and LangChain."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -25,6 +25,15 @@ cuda = [
     "nvidia-cublas-cu12",
     "nvidia-cudnn-cu12>=9",
 ]
+# ClaudeAgent
+claude = ["anthropic>=1.0"]
+# LangGraphAgent / LangChainAgent (+ ChatOllama for local models)
+langgraph = [
+    "langgraph>=1.0",
+    "langchain-core>=1.0",
+    "langchain-ollama>=1.0",
+]
+all = ["voicekit[cuda,claude,langgraph]"]
 
 [tool.setuptools]
-packages = ["voicekit"]
+packages = ["voicekit", "voicekit.agents"]
