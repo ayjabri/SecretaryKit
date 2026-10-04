@@ -10,7 +10,8 @@ Usage
     python voice_assistant.py --model qwen3.6:27b --voice am_michael
     python voice_assistant.py --backend claude                 # Claude Opus 5.5
     python voice_assistant.py --backend openai --host http://10.0.0.100:8000
-    python voice_assistant.py --interruptible                  # with headphones
+    python voice_assistant.py --interruptible                  # "hang on" stops it
+    python voice_assistant.py --interruptible --barge-in speech  # headphones
     python voice_assistant.py --list-devices
 
 Ask naturally ("show me the available models", "think harder", "talk a bit
@@ -92,8 +93,13 @@ def parse_args(argv=None):
                        help="speaker ID or part of its name")
 
     parser.add_argument("--interruptible", action="store_true",
-                        help="talk over the assistant to interrupt it "
-                             "(use headphones)")
+                        help="say 'stop' or 'hang on' to cut the assistant off")
+    parser.add_argument("--barge-in", choices=("phrase", "speech"),
+                        default="phrase",
+                        help="with --interruptible: 'phrase' stops only on a "
+                             "stop phrase (works with speakers); 'speech' "
+                             "stops instantly on any speech (needs "
+                             "headphones) (default: %(default)s)")
     parser.add_argument("--command-prefix", default=None,
                         help="wake word required before exact voice "
                              "commands, e.g. 'computer'")
@@ -185,6 +191,7 @@ def main(argv=None):
         speaker,
         SessionConfig(
             interruptible=args.interruptible,
+            barge_in=args.barge_in,
             command_prefix=args.command_prefix,
             control_tools=not args.no_tools,
         ),

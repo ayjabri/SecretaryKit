@@ -102,15 +102,28 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(log[i - 1], "mute")
         self.assertEqual(log[i + 1], "unmute")
 
-    def test_mic_stays_on_when_interruptible(self):
+    def test_mic_stays_on_for_speech_barge_in(self):
         session, recognizer, _, log, _ = make_session(
-            EchoAgent(), ["Hi"], interruptible=True
+            EchoAgent(), ["Hi"], interruptible=True, barge_in="speech"
         )
 
         session.run()
 
         self.assertNotIn("mute", log)
         self.assertIsNone(recognizer.on_speech_start)
+
+    def test_phrase_barge_in_mutes_and_watches(self):
+        session, recognizer, _, log, _ = make_session(
+            EchoAgent(), ["Hi"], interruptible=True
+        )
+
+        session.start()
+        self.assertIsNotNone(recognizer.on_heard)
+        self.assertIsNone(recognizer.on_speech_start)
+
+        session.run()
+        self.assertIn("mute", log)
+        self.assertIsNone(recognizer.on_heard)
 
     def test_function_agent(self):
         session, _, speaker, _, _ = make_session(
@@ -442,7 +455,8 @@ class InterruptTests(unittest.TestCase):
                 closed.append(True)
 
         session, recognizer, speaker, _, events = make_session(
-            FunctionAgent(agent), ["Tell me a story"], interruptible=True
+            FunctionAgent(agent), ["Tell me a story"], interruptible=True,
+            barge_in="speech",
         )
 
         count = [0]
@@ -461,7 +475,9 @@ class InterruptTests(unittest.TestCase):
         self.assertTrue(session.cancelled)
 
     def test_speech_while_idle_stops_nothing(self):
-        session, _, _, log, _ = make_session(EchoAgent(), [], interruptible=True)
+        session, _, _, log, _ = make_session(
+            EchoAgent(), [], interruptible=True, barge_in="speech"
+        )
         session.start()
 
         session._on_user_speech()
@@ -469,13 +485,80 @@ class InterruptTests(unittest.TestCase):
         self.assertNotIn("stop", log)
 
     def test_speech_while_asking_is_the_answer(self):
-        session, _, _, log, _ = make_session(EchoAgent(), [], interruptible=True)
+        session, _, _, log, _ = make_session(
+            EchoAgent(), [], interruptible=True, barge_in="speech"
+        )
         session._responding = True
         session._asking = True
 
         session._on_user_speech()
 
         self.assertNotIn("stop", log)
+
+    def _story_session(self, heard_at_token3):
+        """A long reply; the recognizer 'hears' something at token 3."""
+
+        def agent(text, ctx):
+            for i in range(50):
+                if ctx.cancelled:
+                    return
+                yield f"word{i} "
+
+        session, recognizer, speaker, _, events = make_session(
+            FunctionAgent(agent), ["Tell me a story"], interruptible=True
+        )
+        count = [0]
+
+        def on_token(token):
+            count[0] += 1
+            if count[0] == 3:
+                recognizer.on_heard(heard_at_token3)
+
+        speaker.on_token = on_token
+        session.run()
+        return session, events
+
+    def test_stop_phrase_stops_reply(self):
+        for heard in ("Hang on.", "Okay, stop there!", "word2 word3 wait"):
+            with self.subTest(heard=heard):
+                session, events = self._story_session(heard)
+                self.assertIn(("interrupted", ""), events)
+                self.assertTrue(session.cancelled)
+
+    def test_other_speech_does_not_stop_reply(self):
+        for heard in ("word1 word2", "What a lovely day", "Stopped by the shop"):
+            with self.subTest(heard=heard):
+                session, events = self._story_session(heard)
+                self.assertNotIn(("interrupted", ""), events)
+
+    def test_own_words_are_not_a_stop_request(self):
+        session, _, _, _, _ = make_session(EchoAgent(), [], interruptible=True)
+        session._said = "Please wait while I check."
+
+        self.assertFalse(session.is_stop_request("please wait while"))
+        self.assertTrue(session.is_stop_request("hang on"))
+
+    def test_overheard_while_idle_or_asking_stops_nothing(self):
+        session, _, _, log, _ = make_session(EchoAgent(), [], interruptible=True)
+        session._on_overheard("stop")
+        session._responding = True
+        session._asking = True
+        session._on_overheard("stop")
+
+        self.assertNotIn("stop", log)
+
+    def test_stop_phrase_alone_is_not_sent_to_agent(self):
+        agent = EchoAgent()
+        session, _, speaker, _, _ = make_session(agent, ["Hang on.", "Hi"])
+
+        session.run()
+
+        self.assertEqual(agent.heard, ["Hi"])
+        self.assertEqual(speaker.spoken, ["You said: Hi"])
+
+    def test_invalid_barge_in(self):
+        with self.assertRaises(ValueError):
+            make_session(EchoAgent(), [], barge_in="loud")
 
 
 class WaitCueTests(unittest.TestCase):

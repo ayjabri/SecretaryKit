@@ -136,7 +136,8 @@ python voice_assistant.py                               # Ollama at 10.0.0.100, 
 python voice_assistant.py --model qwen3.6:27b --voice am_michael
 python voice_assistant.py --backend claude              # Claude Opus 5.5
 python voice_assistant.py --backend openai --host http://server:8000
-python voice_assistant.py --interruptible --output 7    # headphones: talk over it to interrupt
+python voice_assistant.py --interruptible               # say "hang on" / "stop there" to cut it off
+python voice_assistant.py --interruptible --barge-in speech --output 7   # headphones: any speech interrupts
 python voice_assistant.py --list-devices
 ```
 
@@ -162,9 +163,24 @@ These run instantly without involving the model. The whole utterance must be the
 `--command-prefix computer` requires a wake word ("Computer, speak faster"). Agents can add their
 own commands through `register_commands(router)`.
 
+## Interrupting
+
+With `interruptible=True` (`--interruptible`) you can cut the assistant off mid-sentence. `barge_in`
+chooses how:
+
+| `barge_in` | Stops on | Speakers OK? | What you said |
+|---|---|---|---|
+| `"phrase"` (default) | a stop phrase: "stop", "hang on", "wait", "stop there", "never mind"... | Yes | Swallowed. Then ask your next question. |
+| `"speech"` | any speech, instantly | No, use headphones | Becomes the next prompt |
+
+In phrase mode the microphone stays muted for prompts, but short snippets are transcribed in the
+background (about a second's delay). A phrase counts only if the assistant didn't just say it
+itself, so its own voice coming through the speakers can't stop it. Change the list with
+`SessionConfig(stop_phrases=(...))`. Run with `--debug` to see each snippet it heard.
+
 ## Session options
 
-`SessionConfig` controls: `interruptible` (talk over the assistant; use headphones),
+`SessionConfig` controls: `interruptible` and `barge_in` (see above),
 `wait_cue` (said when the agent is slow to start, default "Let me think about that." after
 2.5 s), `speak_status`, `show_thinking`, `control_tools`, `greeting`, the exit and reset phrases,
 and more. Each option is documented in its docstring. For a custom UI, pass

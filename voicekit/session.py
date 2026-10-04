@@ -21,6 +21,7 @@ The session knows nothing about models or tools. It:
 """
 
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -35,7 +36,7 @@ from .agent import (
     ToolFinished,
     ToolStarted,
 )
-from .commands import NOT_HANDLED, CommandRouter
+from .commands import NOT_HANDLED, CommandRouter, normalize_command
 from .tools import classify_confirmation, tool
 
 
@@ -46,10 +47,24 @@ logger = logging.getLogger(__name__)
 class SessionConfig:
     """
     interruptible
-        Keep the microphone on while the assistant speaks, so you can talk
-        over it to cut it off. Needs headphones (or echo cancellation);
-        otherwise it hears itself. When False the microphone is muted
-        while the agent works and speaks.
+        Let you cut the assistant off while it speaks. When False the
+        microphone is muted while the agent works and speaks.
+
+    barge_in
+        How an interruptible session is interrupted:
+          "phrase"  only by a stop phrase ("hang on", "stop there").
+                    Works with speakers: the assistant's own voice and
+                    background talk are ignored, and nothing said while
+                    it speaks becomes a prompt. Takes about a second.
+          "speech"  by any speech, instantly, and what you say becomes
+                    the next prompt. Needs headphones, otherwise the
+                    microphone hears the assistant and it stops itself.
+
+    stop_phrases
+        Phrases that stop the assistant. Matched anywhere in what was
+        heard, except phrases the assistant itself just said. On their
+        own they are also exact commands that do nothing, so "hang on"
+        is never sent to the agent.
 
     resume_delay_ms
         After speaking, wait this long before listening again so the end
@@ -84,6 +99,13 @@ class SessionConfig:
     """
 
     interruptible: bool = False
+    barge_in: Literal["phrase", "speech"] = "phrase"
+    stop_phrases: tuple = (
+        "stop", "stop there", "stop it", "stop talking", "okay stop",
+        "hang on", "hold on", "wait", "wait a second", "wait a minute",
+        "one second", "pause", "be quiet", "quiet", "shut up", "enough",
+        "that's enough", "never mind",
+    )
     resume_delay_ms: int = 300
     greeting: Optional[str] = "Hi, I'm listening."
     goodbye: str = "Goodbye!"
@@ -186,6 +208,18 @@ class VoiceSession:
         if self.config.control_tools and getattr(agent, "tools", None) is not None:
             agent.tools.add(*control_tools())
 
+        if self.config.barge_in not in ("phrase", "speech"):
+            raise ValueError('barge_in must be "phrase" or "speech"')
+
+        self._stop_patterns = [
+            re.compile(rf"\b{re.escape(normalize_command(p))}\b")
+            for p in self.config.stop_phrases
+        ]
+        # Speech mode keeps the microphone live; phrase mode mutes it as
+        # usual and only watches for stop phrases.
+        self._mic_live = self.config.interruptible and self.config.barge_in == "speech"
+        self._said = ""
+
         self._prompts = None
         self._quit = False
         self._responding = False
@@ -211,8 +245,15 @@ class VoiceSession:
         self.speaker.load()
         self.recognizer.load()
 
-        if self.config.interruptible:
+        if not self.config.interruptible:
+            return
+
+        if self._mic_live:
             self.recognizer.on_speech_start = self._on_user_speech
+        elif hasattr(self.recognizer, "watch"):
+            self.recognizer.watch(self._on_overheard)
+        else:
+            logger.warning("This recognizer can't listen for stop phrases.")
 
     def run(self):
         """Converse until a goodbye (spoken or via a tool) or Ctrl+C."""
@@ -234,6 +275,8 @@ class VoiceSession:
         finally:
             self._prompts = None
             self.recognizer.on_speech_start = None
+            if hasattr(self.recognizer, "watch"):
+                self.recognizer.watch(None)
             self.speaker.stop()
 
     def close(self):
@@ -273,6 +316,7 @@ class VoiceSession:
         self._thinking_shown = False
         self._reply_started = False
         self._spoken = False
+        self._said = ""
         self._start_wait_cue()
 
         stream = None
@@ -314,11 +358,13 @@ class VoiceSession:
                 self._stop_wait_cue()
                 self._start_reply()
                 self._emit("assistant_text", item.text)
+                self._said += item.text
                 yield item.text
 
             elif isinstance(item, Status) and item.speak and self.config.speak_status:
                 self._stop_wait_cue()
                 self._show(item)
+                self._said += f" {item.text} "
                 # Its own sentence, in order with the rest of the reply.
                 yield f"\n{item.text}\n"
 
@@ -329,6 +375,7 @@ class VoiceSession:
         self._end_reply()
         self._emit("error", message)
         logger.debug("Agent error", exc_info=exc)
+        self._said += f" {self.config.error_reply}"
         self.speaker.speak(self.config.error_reply, wait=True)
 
     # --------------------------------------------------
@@ -355,6 +402,7 @@ class VoiceSession:
         elif isinstance(event, Status) and event.speak and self.config.speak_status:
             self._show(event)
             self._stop_wait_cue()
+            self._said += f" {event.text}"
             self.speaker.speak(event.text)
         else:
             self._show(event)
@@ -369,6 +417,7 @@ class VoiceSession:
         separator = " " if self._reply_started else ""
         self._start_reply()
         self._emit("assistant_text", separator + text)
+        self._said += f" {text}"
         self.speaker.speak(text)
 
     def ask(self, question):
@@ -496,6 +545,7 @@ class VoiceSession:
         """Speak a complete phrase (greeting, command reply) and wait."""
 
         self._mute()
+        self._said = text
 
         try:
             self._emit("assistant_start")
@@ -525,6 +575,7 @@ class VoiceSession:
         def fire():
             if self._responding and not self._spoken:
                 self._spoken = True
+                self._said += f" {self.config.wait_cue}"
                 self.speaker.speak(self.config.wait_cue)
 
         self._cue_timer = threading.Timer(self.config.wait_cue_after_s, fire)
@@ -542,22 +593,46 @@ class VoiceSession:
     # --------------------------------------------------
 
     def _mute(self):
-        if not self.config.interruptible:
+        if not self._mic_live:
             self.recognizer.pause()
 
     def _unmute(self):
-        if not self.config.interruptible:
+        if not self._mic_live:
             self.speaker.wait()
             time.sleep(self.config.resume_delay_ms / 1000)
             self.recognizer.resume()
 
     def _on_user_speech(self):
-        # Runs on the recognizer's capture thread.
+        # barge_in="speech": runs on the recognizer's capture thread as
+        # soon as anyone starts talking.
         if self._asking:
             return
         if self._responding or self.speaker.is_speaking:
-            self._cancelled = True
-            self.speaker.stop()
+            self._interrupt()
+
+    def _on_overheard(self, text):
+        # barge_in="phrase": runs on the recognizer's worker thread with
+        # what it heard while muted, which may be our own voice.
+        if self._asking or not (self._responding or self.speaker.is_speaking):
+            return
+        if self.is_stop_request(text):
+            logger.info("Stopped by %r", text)
+            self._interrupt()
+
+    def is_stop_request(self, heard):
+        """
+        True if `heard` contains a stop phrase that the assistant didn't
+        just say itself (the microphone picks up the speakers).
+        """
+        heard = normalize_command(heard)
+        said = normalize_command(self._said)
+        return any(
+            p.search(heard) and not p.search(said) for p in self._stop_patterns
+        )
+
+    def _interrupt(self):
+        self._cancelled = True
+        self.speaker.stop()
 
     def _teach_vocabulary(self):
         """Pass agent-specific words (e.g. model names) to Whisper."""
@@ -579,6 +654,8 @@ class VoiceSession:
                       "goodbye")
         c.add_phrases("reset", self.config.reset_phrases,
                       self.reset_conversation, "new conversation")
+        # "Hang on" on its own, when nothing is being said: just wait.
+        c.add_phrases("stop", self.config.stop_phrases, lambda: None)
         c.add("faster", r"(?:speak|talk)(?: a bit| a little)? faster",
               lambda: self.change_speed(+1), "speak faster")
         c.add("slower", r"(?:speak|talk)(?: a bit| a little)? slower",

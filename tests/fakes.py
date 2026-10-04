@@ -20,10 +20,14 @@ class FakeRecognizer:
         self.prompts = list(prompts)
         self.log = log if log is not None else []
         self.on_speech_start = None
+        self.on_heard = None
         self.config = SimpleNamespace(hotwords=None)
 
     def load(self):
         self.log.append("recognizer.load")
+
+    def watch(self, on_heard):
+        self.on_heard = on_heard
 
     def listen(self):
         for text in self.prompts:

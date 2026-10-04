@@ -536,6 +536,45 @@ class ListenPipelineTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(recognizer._model.calls, [])
 
+    def test_watch_hears_snippets_while_paused(self):
+        recognizer = self.listen_with_script(
+            # 1 s of speech: cut into snippets of at most 1.5 s.
+            [(0.5, "silence"), (1.0, "voice"), (2.0, "silence")],
+            [[" Hang on."]],
+        )
+        heard = []
+        recognizer.watch(heard.append)
+        recognizer.pause()
+
+        result = recognizer.listen_once(timeout=1.5)
+
+        self.assertIsNone(result)  # nothing became a prompt
+        self.assertEqual(heard, ["Hang on."])
+        self.assertEqual(recognizer._model.calls[0].kwargs["beam_size"], 1)
+
+    def test_long_speech_while_paused_is_cut_into_short_snippets(self):
+        recognizer = self.listen_with_script(
+            [(4.0, "voice"), (2.0, "silence")],
+            [[" one"], [" two"], [" three"]],
+        )
+        heard = []
+        recognizer.watch(heard.append)
+        recognizer.pause()
+
+        recognizer.listen_once(timeout=1.5)
+
+        self.assertEqual(heard, ["One", "Two", "Three"])
+
+    def test_nothing_watched_when_not_paused_or_not_watching(self):
+        recognizer = self.listen_with_script(
+            [(1.0, "voice"), (2.0, "silence")], [[" Hello."]],
+        )
+        recognizer.pause()
+
+        recognizer.listen_once(timeout=1)
+
+        self.assertEqual(recognizer._model.calls, [])
+
     def test_on_speech_start_called_before_transcription(self):
         recognizer = self.listen_with_script(
             [(1.0, "voice"), (2.0, "silence")],
@@ -560,6 +599,27 @@ class ListenPipelineTests(unittest.TestCase):
         # The fake stream sends digital silence.
         self.assertEqual(recognizer.noise_floor_dbfs, -100.0)
         self.assertEqual(recognizer.noise_threshold_dbfs, -50.0)
+
+    def test_calibration_ignores_speech_with_pauses(self):
+        # Talking for half the calibration second: the pauses are the room.
+        recognizer = self.listen_with_script(
+            [(0.25, "voice"), (0.25, "silence")] * 4, [], noise_floor_dbfs=None,
+        )
+
+        recognizer.listen_once(timeout=0.5)
+
+        self.assertEqual(recognizer.noise_floor_dbfs, -100.0)
+
+    def test_calibration_during_continuous_sound_is_capped(self):
+        recognizer = self.listen_with_script(
+            [(3.0, "voice")], [], noise_floor_dbfs=None,
+        )
+
+        with self.assertLogs(sr.logger, "WARNING"):
+            recognizer.listen_once(timeout=0.5)
+
+        self.assertEqual(recognizer.noise_floor_dbfs, -40.0)
+        self.assertEqual(recognizer.noise_threshold_dbfs, -30.0)
 
     def test_dead_microphone_raises(self):
         recognizer = make_recognizer()

@@ -46,6 +46,14 @@ WHISPER_SAMPLE_RATE = 16000
 # Raise an error if the microphone delivers nothing for this long.
 NO_AUDIO_TIMEOUT_SECONDS = 3.0
 
+# Percentile of calibration frame levels taken as the noise floor.
+CALIBRATION_PERCENTILE = 20
+
+# Snippets for watch(): end after a short pause, at most this long.
+WATCH_END_MS = 300
+WATCH_MIN_SPEECH_MS = 200
+WATCH_MAX_MS = 1500
+
 # Phrases Whisper commonly invents from breaths, clicks and other
 # non-speech. They are only discarded when they are the *entire*
 # transcript, so they are still kept inside a longer sentence.
@@ -102,8 +110,9 @@ class SpeechRecognizerConfig:
         Ambient-noise calibration duration.
 
     max_noise_floor_dbfs
-        A calibrated noise floor above this logs a warning
-        (usually means someone spoke during calibration).
+        Upper limit for a calibrated noise floor. Louder means someone
+        spoke (or audio played) throughout calibration; this value is
+        used instead, with a warning.
 
     Segmentation
     ------------
@@ -324,6 +333,14 @@ def _dbfs(frame):
         return -100.0
 
     return 20.0 * math.log10(rms / 32768.0)
+
+
+def _drain(q):
+    while True:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            return
 
 
 # --------------------------------------------------
@@ -592,6 +609,21 @@ class ContinuousSpeechRecognizer:
             prompt_end_frames=to_frames(config.prompt_end_ms),
         )
 
+        # Cuts what is heard while paused into short snippets for watch():
+        # quick to end and never long, so "stop" is heard promptly even
+        # over the assistant's own voice.
+        self._watch_segmenter = _Segmenter(
+            frame_ms=config.frame_ms,
+            start_frames=to_frames(config.speech_start_ms),
+            end_frames=to_frames(WATCH_END_MS),
+            min_speech_frames=to_frames(WATCH_MIN_SPEECH_MS),
+            pre_roll_frames=to_frames(config.pre_roll_ms),
+            max_frames=to_frames(WATCH_MAX_MS),
+            prompt_end_frames=to_frames(config.prompt_end_ms),
+        )
+        self._watch_queue = queue.Queue(maxsize=8)
+        self._on_heard = None
+
         self._vad = webrtcvad.Vad(config.vad_mode)
 
         self.noise_floor_dbfs = None
@@ -684,6 +716,16 @@ class ContinuousSpeechRecognizer:
 
     def resume(self):
         self._paused.clear()
+
+    def watch(self, on_heard):
+        """
+        While paused, keep transcribing short snippets of speech and call
+        on_heard(text) with each (on a worker thread). Nothing heard this
+        way becomes a prompt. Lets a voice loop hear "stop" over its own
+        speech without its speech, picked up by the microphone, being
+        taken for yours. watch(None) turns it off.
+        """
+        self._on_heard = on_heard
 
     # --------------------------------------------------
     # Public utilities
@@ -814,7 +856,11 @@ class ContinuousSpeechRecognizer:
                 if self._paused.is_set():
                     if not was_paused:
                         self._segmenter.reset()
+                        self._watch_segmenter.reset()
+                        _drain(self._watch_queue)
                         was_paused = True
+                    if self._on_heard is not None:
+                        self._watch_frame(frame)
                     continue
 
                 was_paused = False
@@ -827,6 +873,38 @@ class ContinuousSpeechRecognizer:
 
         except Exception as exc:
             self._events.put(_CaptureError(exc))
+
+    def _watch_frame(self, frame):
+
+        for event in self._watch_segmenter.feed(frame, self._is_voice(frame)):
+            if isinstance(event, _Utterance):
+                try:
+                    self._watch_queue.put_nowait(event.pcm)
+                except queue.Full:
+                    logger.debug("Transcription is behind; dropping a snippet.")
+
+    def _watch_loop(self):
+        """Transcribes snippets heard while paused (see watch())."""
+
+        while not self._stop.is_set():
+
+            try:
+                pcm = self._watch_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            on_heard = self._on_heard
+            if on_heard is None or not self._paused.is_set():
+                continue
+
+            try:
+                # Greedy decoding: snippets must be fast, not perfect.
+                result = self.transcribe_audio(pcm, self.config.sample_rate, beam_size=1)
+                if result["text"]:
+                    logger.debug("Heard while paused: %r", result["text"])
+                    on_heard(result["text"])
+            except Exception:
+                logger.exception("Handling speech heard while paused failed")
 
     def _notify_speech_started(self):
 
@@ -877,22 +955,30 @@ class ContinuousSpeechRecognizer:
         if not levels:
             return
 
-        # Percentile is more resistant to brief clicks than the maximum.
-        self._set_noise_floor(float(np.percentile(levels, 70)))
+        # Steady background noise is present in every frame, speech only in
+        # some (people pause between words), so a low percentile measures
+        # the room even if someone talks during calibration.
+        noise_floor = float(np.percentile(levels, CALIBRATION_PERCENTILE))
+
+        if noise_floor > self.config.max_noise_floor_dbfs:
+            # Most likely continuous speech or the speakers playing. Taking
+            # it as the noise floor would make the recognizer deaf.
+            logger.warning(
+                "Calibration heard %.1f dBFS, too loud for room noise "
+                "(was someone talking, or audio playing?). Using %.1f "
+                "dBFS instead; set noise_floor_dbfs to choose.",
+                noise_floor,
+                self.config.max_noise_floor_dbfs,
+            )
+            noise_floor = self.config.max_noise_floor_dbfs
+
+        self._set_noise_floor(noise_floor)
 
         logger.info("Ambient noise: %.1f dBFS", self.noise_floor_dbfs)
         logger.info(
             "Speech energy threshold: %.1f dBFS",
             self.noise_threshold_dbfs,
         )
-
-        if self.noise_floor_dbfs > self.config.max_noise_floor_dbfs:
-            logger.warning(
-                "Ambient noise is high (%.1f dBFS). If anyone spoke "
-                "during calibration, quiet speech will be ignored; set "
-                "noise_floor_dbfs explicitly or recalibrate.",
-                self.noise_floor_dbfs,
-            )
 
     def recalibrate(self):
         """Measure ambient noise again at the start of the next listen."""
@@ -918,13 +1004,17 @@ class ContinuousSpeechRecognizer:
         self._ready.clear()
         self._segmenter.reset()
 
-        for q in (self._audio_queue, self._events):
-            while not q.empty():
-                q.get_nowait()
+        for q in (self._audio_queue, self._events, self._watch_queue):
+            _drain(q)
 
         thread = threading.Thread(
             target=self._capture_loop,
             name="speech-capture",
+            daemon=True,
+        )
+        watcher = threading.Thread(
+            target=self._watch_loop,
+            name="speech-watch",
             daemon=True,
         )
 
@@ -938,12 +1028,14 @@ class ContinuousSpeechRecognizer:
                 callback=self._audio_callback,
             ):
                 thread.start()
+                watcher.start()
 
                 try:
                     yield
                 finally:
                     self._stop.set()
                     thread.join()
+                    watcher.join()
         finally:
             self._listening = False
 
@@ -1081,11 +1173,13 @@ class ContinuousSpeechRecognizer:
     # Whisper
     # --------------------------------------------------
 
-    def transcribe_audio(self, audio, sample_rate=WHISPER_SAMPLE_RATE, context=None):
+    def transcribe_audio(self, audio, sample_rate=WHISPER_SAMPLE_RATE, context=None,
+                         beam_size=None):
         """
         Transcribe int16 PCM bytes or a numpy array.
 
-        Usable on its own, e.g. for audio files or testing.
+        Usable on its own, e.g. for audio files or testing. beam_size
+        overrides the configured one.
         """
 
         model = self.load()
@@ -1100,7 +1194,7 @@ class ContinuousSpeechRecognizer:
         segments, info = model.transcribe(
             audio,
             language=self.config.language,
-            beam_size=self.config.beam_size,
+            beam_size=beam_size or self.config.beam_size,
             initial_prompt=prompt or None,
             hotwords=self.config.hotwords,
             condition_on_previous_text=False,
