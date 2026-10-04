@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voicekit"
+version = "0.1.0"
+description = "Local speech-to-text (Whisper), text-to-speech (Kokoro) and streaming LLM chat for voice interfaces."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "sounddevice>=0.4.6",
+    "soundfile>=0.12",
+    "webrtcvad-wheels>=2.0.11",
+    "faster-whisper>=1.1",
+    "kokoro>=0.9.4",
+    "huggingface_hub>=0.20",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+# CUDA libraries for faster-whisper on Windows/Linux GPUs.
+cuda = [
+    "nvidia-cublas-cu12",
+    "nvidia-cudnn-cu12>=9",
+]
+
+[tool.setuptools]
+packages = ["voicekit"]
