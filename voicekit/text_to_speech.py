@@ -368,6 +368,12 @@ class KokoroSpeaker:
             dtype=np.float32,
         )
 
+        # Called with every block handed to the sound card, silence
+        # included: on_playback(samples, sample_rate). For echo
+        # cancellation (voicekit.echo). Runs on the audio thread, so it
+        # must be quick.
+        self.on_playback = None
+
     # --------------------------------------------------
     # Lifecycle
     # --------------------------------------------------
@@ -436,6 +442,11 @@ class KokoroSpeaker:
     # --------------------------------------------------
     # Public API
     # --------------------------------------------------
+
+    @property
+    def output_latency(self):
+        """Seconds from audio leaving this class to the speakers (0 if closed)."""
+        return self._stream.latency if self._stream is not None else 0.0
 
     @property
     def is_speaking(self):
@@ -789,6 +800,13 @@ class KokoroSpeaker:
 
         out[filled:] = 0
         np.clip(out, -1.0, 1.0, out=out)
+
+        on_playback = self.on_playback
+        if on_playback is not None:
+            try:
+                on_playback(out, KOKORO_SAMPLE_RATE)
+            except Exception:
+                logger.exception("on_playback failed")
 
     def _update_idle(self):
         # Caller holds self._lock.

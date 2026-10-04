@@ -100,6 +100,11 @@ def parse_args(argv=None):
                              "stop phrase (works with speakers); 'speech' "
                              "stops instantly on any speech (needs "
                              "headphones) (default: %(default)s)")
+    parser.add_argument("--echo-cancellation", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="remove the assistant's voice from the microphone "
+                             "(default: on with --interruptible if livekit is "
+                             "installed)")
     parser.add_argument("--command-prefix", default=None,
                         help="wake word required before exact voice "
                              "commands, e.g. 'computer'")
@@ -192,6 +197,7 @@ def main(argv=None):
         SessionConfig(
             interruptible=args.interruptible,
             barge_in=args.barge_in,
+            echo_cancellation=args.echo_cancellation,
             command_prefix=args.command_prefix,
             control_tools=not args.no_tools,
         ),

@@ -561,6 +561,67 @@ class InterruptTests(unittest.TestCase):
             make_session(EchoAgent(), [], barge_in="loud")
 
 
+class EchoCancellationTests(unittest.TestCase):
+
+    def make(self, **config):
+        session, recognizer, speaker, _, _ = make_session(EchoAgent(), [], **config)
+        speaker.on_playback = None
+        speaker.output_latency = 0.18
+        recognizer.echo_canceller = None
+        return session, recognizer, speaker
+
+    def test_on_for_interruptible_sessions(self):
+        try:
+            import livekit.rtc  # noqa: F401
+        except ImportError:
+            self.skipTest("pip install livekit")
+
+        session, recognizer, speaker = self.make(interruptible=True)
+        session.start()
+
+        canceller = recognizer.echo_canceller
+        self.assertIsNotNone(canceller)
+        self.assertEqual(speaker.on_playback, canceller.playback)
+
+        session.run()  # start() again inside run(): keeps the same canceller
+        self.assertIs(recognizer.echo_canceller, canceller)
+
+        session.close()
+        self.assertIsNone(recognizer.echo_canceller)
+        self.assertIsNone(speaker.on_playback)
+        self.assertTrue(canceller._closed)
+
+    def test_off_when_mic_is_muted_while_speaking(self):
+        session, recognizer, speaker = self.make()
+        session.start()
+
+        self.assertIsNone(recognizer.echo_canceller)
+
+    def test_can_be_turned_off(self):
+        session, recognizer, _ = self.make(interruptible=True, echo_cancellation=False)
+        session.start()
+
+        self.assertIsNone(recognizer.echo_canceller)
+
+    def test_missing_livekit(self):
+        from unittest import mock
+
+        with mock.patch.dict(sys.modules, {"livekit": None}):
+            session, recognizer, _ = self.make(interruptible=True)
+            session.start()  # optional: carries on without it
+            self.assertIsNone(recognizer.echo_canceller)
+
+            session, _, _ = self.make(interruptible=True, echo_cancellation=True)
+            with self.assertRaises(ImportError):  # required: fails loudly
+                session.start()
+
+    def test_devices_without_support_are_left_alone(self):
+        session, recognizer, _, _, _ = make_session(EchoAgent(), [], interruptible=True)
+        session.start()
+
+        self.assertFalse(hasattr(recognizer, "echo_canceller"))
+
+
 class WaitCueTests(unittest.TestCase):
 
     def test_slow_agent_gets_a_cue(self):

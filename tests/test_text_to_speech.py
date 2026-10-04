@@ -236,7 +236,13 @@ class FakeOutputStream:
             time.sleep(self.blocksize / self.samplerate / 4)
 
     def nonzero_samples(self):
-        return int(sum(np.count_nonzero(block) for block in self.played))
+        # speak(wait=True) returns once the last block is handed over,
+        # inside the callback; let _run record it (and one more) first.
+        target = len(self.played) + 2
+        deadline = time.monotonic() + 2
+        while len(self.played) < target and time.monotonic() < deadline:
+            time.sleep(0.001)
+        return int(sum(np.count_nonzero(block) for block in list(self.played)))
 
 
 def make_speaker(pipeline=None, **config):

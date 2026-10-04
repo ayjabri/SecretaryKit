@@ -36,6 +36,7 @@ from .agent import (
     TurnContext,
 )
 from .commands import NOT_HANDLED, CommandRouter
+from .echo import EchoCanceller
 from .llm_client import (
     VOICE_SYSTEM_PROMPT,
     LLMClient,
@@ -67,5 +68,5 @@ __all__ = [
     "LLMClient", "LLMConfig", "LLMError", "ToolCall", "VOICE_SYSTEM_PROMPT",
     "ContinuousSpeechRecognizer", "SpeechRecognizerConfig", "clean_text",
     "KokoroSpeaker", "TextToSpeechConfig", "SentenceSplitter",
-    "prepare_for_speech", "KOKORO_SAMPLE_RATE",
+    "prepare_for_speech", "KOKORO_SAMPLE_RATE", "EchoCanceller",
 ]

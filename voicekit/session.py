@@ -60,6 +60,13 @@ class SessionConfig:
                     the next prompt. Needs headphones, otherwise the
                     microphone hears the assistant and it stops itself.
 
+    echo_cancellation
+        Remove the assistant's own voice from the microphone (WebRTC
+        AEC3, needs `pip install "voicekit[aec]"`). None: on for
+        interruptible sessions when installed. True: required. False: off.
+        Only matters when the microphone is on while the assistant
+        speaks, i.e. interruptible sessions.
+
     stop_phrases
         Phrases that stop the assistant. Matched anywhere in what was
         heard, except phrases the assistant itself just said. On their
@@ -100,6 +107,7 @@ class SessionConfig:
 
     interruptible: bool = False
     barge_in: Literal["phrase", "speech"] = "phrase"
+    echo_cancellation: Optional[bool] = None
     stop_phrases: tuple = (
         "stop", "stop there", "stop it", "stop talking", "okay stop",
         "hang on", "hold on", "wait", "wait a second", "wait a minute",
@@ -229,6 +237,7 @@ class VoiceSession:
         self._reply_started = False
         self._spoken = False
         self._cue_timer = None
+        self._echo_canceller = None
 
     # --------------------------------------------------
     # Lifecycle
@@ -244,6 +253,7 @@ class VoiceSession:
         self._emit("status", "Loading speech models")
         self.speaker.load()
         self.recognizer.load()
+        self._setup_echo_cancellation()
 
         if not self.config.interruptible:
             return
@@ -283,6 +293,12 @@ class VoiceSession:
         self.agent.close()
         self.speaker.close()
         self.recognizer.close()
+
+        if self._echo_canceller is not None:
+            self.speaker.on_playback = None
+            self.recognizer.echo_canceller = None
+            self._echo_canceller.close()
+            self._echo_canceller = None
 
     def __enter__(self):
         return self
@@ -633,6 +649,43 @@ class VoiceSession:
     def _interrupt(self):
         self._cancelled = True
         self.speaker.stop()
+
+    def _setup_echo_cancellation(self):
+
+        if self._echo_canceller is not None:
+            return  # already set up (run() after start())
+
+        wanted = self.config.echo_cancellation
+        if wanted is None:
+            wanted = self.config.interruptible
+        if not wanted:
+            return
+
+        if not (hasattr(self.speaker, "on_playback")
+                and hasattr(self.recognizer, "echo_canceller")):
+            logger.warning("This speaker or recognizer doesn't support echo cancellation.")
+            return
+
+        from .echo import EchoCanceller
+
+        try:
+            canceller = EchoCanceller()
+        except ImportError:
+            if self.config.echo_cancellation:
+                raise
+            logger.warning(
+                'Echo cancellation is off: pip install "voicekit[aec]" so the '
+                "microphone doesn't hear the assistant."
+            )
+            return
+
+        frame_s = getattr(getattr(self.recognizer, "config", None), "frame_ms", 30) / 1000
+        canceller.set_delay((getattr(self.speaker, "output_latency", 0.0) + frame_s) * 1000)
+
+        self.speaker.on_playback = canceller.playback
+        self.recognizer.echo_canceller = canceller
+        self._echo_canceller = canceller
+        self._emit("status", "Echo cancellation on")
 
     def _teach_vocabulary(self):
         """Pass agent-specific words (e.g. model names) to Whisper."""

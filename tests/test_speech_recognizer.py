@@ -575,6 +575,25 @@ class ListenPipelineTests(unittest.TestCase):
 
         self.assertEqual(recognizer._model.calls, [])
 
+    def test_echo_canceller_cleans_every_frame(self):
+        recognizer = self.listen_with_script(
+            [(1.0, "voice"), (2.0, "silence")], [[" Should not appear."]],
+        )
+
+        class Silencer:
+            """Pretends all the 'voice' was the speakers' echo."""
+            frames = 0
+
+            def process(self, pcm, sample_rate):
+                self.frames += 1
+                return bytes(len(pcm))
+
+        recognizer.echo_canceller = Silencer()
+        result = recognizer.listen_once(timeout=1)
+
+        self.assertIsNone(result)
+        self.assertGreater(recognizer.echo_canceller.frames, 30)
+
     def test_on_speech_start_called_before_transcription(self):
         recognizer = self.listen_with_script(
             [(1.0, "voice"), (2.0, "silence")],

@@ -654,6 +654,11 @@ class ContinuousSpeechRecognizer:
         # to interrupt text-to-speech. Must return quickly.
         self.on_speech_start = None
 
+        # Optional voicekit.echo.EchoCanceller (anything with
+        # process(pcm, sample_rate) -> pcm): every microphone frame passes
+        # through it before speech detection, calibration and Whisper.
+        self.echo_canceller = None
+
     # --------------------------------------------------
     # Lifecycle
     # --------------------------------------------------
@@ -835,8 +840,14 @@ class ContinuousSpeechRecognizer:
             buffer += chunk
 
             while len(buffer) >= frame_bytes:
-                yield buffer[:frame_bytes]
+                frame = buffer[:frame_bytes]
                 buffer = buffer[frame_bytes:]
+
+                echo_canceller = self.echo_canceller
+                if echo_canceller is not None:
+                    frame = echo_canceller.process(frame, self.config.sample_rate)
+
+                yield frame
 
     def _capture_loop(self):
 

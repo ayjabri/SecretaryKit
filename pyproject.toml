@@ -33,7 +33,9 @@ langgraph = [
     "langchain-core>=1.0",
     "langchain-ollama>=1.0",
 ]
-all = ["voicekit[cuda,claude,langgraph]"]
+# Echo cancellation (WebRTC AEC3): the mic stops hearing the assistant
+aec = ["livekit>=1.0"]
+all = ["voicekit[cuda,claude,langgraph,aec]"]
 
 [tool.setuptools]
 packages = ["voicekit", "voicekit.agents"]

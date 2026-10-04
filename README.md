@@ -23,7 +23,7 @@ pip install "voicekit[cuda,langgraph,claude] @ git+https://github.com/ayjabri/vo
 ```
 
 Extras: `cuda` (GPU libraries for Whisper), `claude` (`anthropic`), `langgraph` (`langgraph`,
-`langchain-core`, `langchain-ollama`), `all`. On a GPU, install a CUDA build of PyTorch first
+`langchain-core`, `langchain-ollama`), `aec` (echo cancellation, `livekit`), `all`. On a GPU, install a CUDA build of PyTorch first
 (Kokoro needs it): https://pytorch.org/get-started/locally/. For development: `pip install -e ".[all]"`.
 
 ## Quick start
@@ -177,6 +177,28 @@ In phrase mode the microphone stays muted for prompts, but short snippets are tr
 background (about a second's delay). A phrase counts only if the assistant didn't just say it
 itself, so its own voice coming through the speakers can't stop it. Change the list with
 `SessionConfig(stop_phrases=(...))`. Run with `--debug` to see each snippet it heard.
+
+### Echo cancellation
+
+With speakers, the microphone hears the assistant as loudly as it hears you. Interruptible
+sessions therefore remove the assistant's voice from the microphone with WebRTC's echo canceller
+(AEC3, as in Chrome and Google Meet), fed the exact audio sent to the speakers:
+
+```bash
+pip install "voicekit[aec]"      # LiveKit's SDK, which bundles WebRTC audio processing
+```
+
+It turns on automatically for interruptible sessions when installed (`--no-echo-cancellation` or
+`SessionConfig(echo_cancellation=False)` to disable). Measured on monitor speakers: the
+assistant's voice at the mic dropped from about -26 to -74 dBFS. With it, `barge_in="speech"`
+becomes usable without headphones. It adapts to the room within a second or two of speech
+(the greeting usually covers that). To use it outside a session:
+
+```python
+aec = EchoCanceller()
+speaker.on_playback = aec.playback       # what the speakers play
+recognizer.echo_canceller = aec          # cleans every microphone frame
+```
 
 ## Session options
 
