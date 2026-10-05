@@ -12,12 +12,13 @@ answers questions about CSV files in --data-dir with its own CSV tools.
 
 Try: "research what's new in Python 3.14", "run the backend tests",
 "deploy to staging", "what's the average price in sales.csv by region",
-"what's 23 times 47", "talk a bit faster", "status", "goodbye".
+"what's 23 times 47", "what can you do?", "talk a bit faster", "status", "goodbye".
 
 Requires: pip install langchain langgraph langchain-ollama pandas
 """
 
 import argparse
+import inspect
 import os
 import sys
 import time
@@ -48,9 +49,10 @@ You are the voice of an orchestrator that runs a team of agents for the user.
 Delegate work with your tools: research for questions that need looking into,
 run_tests for testing, deploy for deployments, ask_data_analyst for any
 question about data in a CSV file (never guess the numbers), and calculator
-for arithmetic. Report results in one or two short spoken sentences, without
-markdown or lists. Answer simple questions yourself. The tools already
-announce their progress, so don't repeat it.
+for arithmetic. When asked what you can do, call list_capabilities and read
+its summary out as it is. Report other results in one or two short spoken
+sentences, without markdown or lists. Answer simple questions yourself. The tools
+already announce their progress, so don't repeat it.
 
 CSV files you can ask the analyst about: {csv_files}
 """
@@ -59,6 +61,14 @@ ANALYST_PROMPT = """\
 You are a data analyst. Answer the question using your CSV tools.
 Always call describe_csv first to learn the columns, then use aggregate_csv.
 Reply with a short factual answer that includes the key numbers. No commentary.
+"""
+
+CAPABILITIES_PROMPT = """\
+Below are the tools of a voice orchestrator, with their source code. Explain
+to the user, in the first person, what you can do. Group related tools, give
+one short example of what the user could say for each group, and mention any
+safeguards (such as asking for approval). This will be spoken aloud: plain
+sentences only, no markdown, lists, code or tool names, under 150 words.
 """
 
 
@@ -123,6 +133,26 @@ def make_csv_tools(data_dir):
     return [describe_csv, aggregate_csv]
 
 
+def describe_tools(tools, helpers=None):
+    """A text catalogue of tools (name, description, arguments, source code)
+    for the model to explain. helpers maps a tool name to the tools of the
+    sub-agent it delegates to."""
+    helpers = helpers or {}
+    sections = []
+    for t in tools:
+        lines = [f"## {t.name}", t.description, f"Arguments: {t.args or 'none'}"]
+        func = getattr(t, "func", None)
+        try:
+            lines.append("Source:\n" + inspect.getsource(func))
+        except (TypeError, OSError):
+            pass  # built-in or wrapped tools: the description has to do
+        if t.name in helpers:
+            lines.append("Delegates to a sub-agent with these tools:")
+            lines.append(describe_tools(helpers[t.name]))
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections)
+
+
 def build_graph(model_name, base_url, data_dir="."):
 
     model = ChatOllama(model=model_name, base_url=base_url, reasoning=False)
@@ -133,7 +163,8 @@ def build_graph(model_name, base_url, data_dir="."):
     researcher = create_agent(
         model, [], system_prompt="You are a research agent. Answer in three sentences."
     )
-    analyst = create_agent(model, make_csv_tools(data_dir), system_prompt=ANALYST_PROMPT)
+    csv_tools = make_csv_tools(data_dir)
+    analyst = create_agent(model, csv_tools, system_prompt=ANALYST_PROMPT)
 
     csv_files = sorted(f for f in os.listdir(data_dir) if f.lower().endswith(".csv"))
 
@@ -178,7 +209,26 @@ def build_graph(model_name, base_url, data_dir="."):
         progress("The data analyst has finished.")
         return result["messages"][-1].content
 
-    tools = [research, run_tests, deploy, ask_data_analyst, tool(calculator)]
+    summary = []  # cached after the first call
+
+    @tool
+    def list_capabilities() -> str:
+        """List what the orchestrator can do, with example requests. Use when the user asks for your functions, tools or capabilities."""
+        if not summary:
+            progress = get_stream_writer()
+            progress("Let me look at what I can do.")
+            catalogue = describe_tools(
+                [t for t in tools if t.name != "list_capabilities"],
+                helpers={"ask_data_analyst": csv_tools},
+            )
+            reply = model.invoke([
+                ("system", CAPABILITIES_PROMPT),
+                ("user", f"CSV files available: {', '.join(csv_files) or 'none'}\n\n{catalogue}"),
+            ])
+            summary.append(reply.content)
+        return summary[0]
+
+    tools = [research, run_tests, deploy, ask_data_analyst, tool(calculator), list_capabilities]
     tools += to_langchain_tools(control_tools())
 
     prompt = SUPERVISOR_PROMPT.format(csv_files=", ".join(csv_files) or "none found")
